@@ -1,0 +1,13 @@
+repositories:
+  src/turtlebot3:
+    type: git
+    url: https://github.com/ROBOTIS-GIT/turtlebot3.git
+    version: 0c0be84e3f5c3194fb2adea8426a58a96060eab5  # jazzy / 2.4.0 (pre-release)
+  src/turtlebot3_msgs:
+    type: git
+    url: https://github.com/ROBOTIS-GIT/turtlebot3_msgs.git
+    version: 9209e01b4708cf3ca5610b01dfc9586d3c7889d8  # jazzy / 2.4.0
+  src/DynamixelSDK:
+    type: git
+    url: https://github.com/ROBOTIS-GIT/DynamixelSDK.git
+    version: 69b30fcab2fb1200b9b7aa884350352393f79552  # jazzy / 4.0.5
