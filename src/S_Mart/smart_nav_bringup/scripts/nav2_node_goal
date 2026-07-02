@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Nav2 노드 도달 테스트 ROS2 노드.
+
+노드명(예: N5)을 입력하면 nodes.yaml의 해당 좌표로 NavigateToPose goal을 보냄 (yaw=0).
+'init N1' 입력 시 N1 좌표를 /initialpose로 발행(AMCL 초기 위치 설정).
+도달 성공/실패 + 소요시간을 출력. 'q' 입력 시 종료.
+
+사전조건: 같은 ROS_DOMAIN_ID에서 Nav2(navigate_to_pose 액션)가 store_map으로 동작 중.
+
+실행:
+    ros2 run path_plan_manager nav2_node_goal
+    # nodes.yaml 경로 직접 지정:
+    ros2 run path_plan_manager nav2_node_goal --ros-args -p nodes_file:=/home/.../nodes.yaml
+사용:
+    node> init N1   # 로봇이 N1에 있을 때 → 초기 위치 설정
+    node> N5        # N5 좌표로 이동 (yaw=0)
+    node> q         # 종료
+"""
+import os
+import math
+import time
+import heapq
+
+import yaml
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from action_msgs.msg import GoalStatus
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from ament_index_python.packages import get_package_share_directory
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+
+# 노드 유형별 yaw 도착 허용오차 (rad). 통로/코너=느슨(빠름) / dock=정밀(마커 정면)
+_YAW_TOL = {'loose': 0.5, 'dock': 0.08}
+
+
+# 도킹 방향(맵 프레임) → yaw(rad). E=오른쪽/+x, N=위/+y, W=왼쪽/−x, S=아래/−y
+_DIR_YAW = {'E': 0.0, 'N': math.pi / 2, 'W': math.pi, 'S': -math.pi / 2}
+
+# 테스트 둘레 주행용 도착 헤딩(진행 방향). 설정 시 dock보다 우선.
+#   하단행 N25→N21: 서(180°) / 좌측열 N16→N1: 북(90°) / 상단행 N2→N5: 동(0°)
+_ROUTE_HEADING = {
+    'N25': 'W', 'N24': 'W', 'N23': 'W', 'N22': 'W', 'N21': 'W',
+    'N16': 'N', 'N11': 'N', 'N6': 'N', 'N1': 'N',
+    'N2': 'E', 'N3': 'E', 'N4': 'E', 'N5': 'E',
+}
+
+
+def _dock_yaw_quat(nd):
+    """노드의 dock 방향 → (z, w) 쿼터니언. dock 없으면(통로) yaw=0.
+
+    dock가 리스트(예: 출고 [W, S])면 첫 번째 방향 사용.
+    """
+    dock = nd.get('dock')
+    if isinstance(dock, list):
+        dock = dock[0] if dock else None
+    yaw = _DIR_YAW.get(dock, 0.0)
+    return math.sin(yaw / 2.0), math.cos(yaw / 2.0), yaw
+
+
+class Nav2NodeGoal(Node):
+    def __init__(self):
+        super().__init__('nav2_node_goal')
+
+        # 기본 nodes.yaml = 패키지 share/maps/nodes.yaml, 파라미터로 덮어쓰기 가능
+        default_path = os.path.join(
+            get_package_share_directory('path_plan_manager'), 'graph', 'nodes.yaml'
+        )
+        self.declare_parameter('nodes_file', default_path)
+        path = self.get_parameter('nodes_file').get_parameter_value().string_value
+
+        with open(path) as f:
+            self.nodes = yaml.safe_load(f)['nodes']
+        self._ac = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        self._init_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        self._param_cli = self.create_client(SetParameters, '/controller_server/set_parameters')
+        self._cur_tol = None              # 마지막으로 설정한 yaw 허용오차 (중복 호출 방지)
+        self.current_node = None          # 현재 노드 (init/주행으로 갱신) — 다익스트라 시작점
+        self._build_graph()               # 4-인접 그래프 자동 생성
+        self.get_logger().info(
+            f'노드 {len(self.nodes)}개 로드, 엣지 {sum(len(v) for v in self.adj.values())//2}개 ({path})'
+        )
+
+    def set_initial_pose(self, name, facing=None):
+        """노드 좌표를 /initialpose로 발행 → AMCL 초기 위치 설정.
+
+        로봇이 실제로 해당 노드 위치/방향에 있을 때 호출해야 정확함.
+        facing: None=dock 방향 / 'E','W','N','S'=그 방향 / 노드명=그 노드를 바라봄
+        """
+        name = name.strip().upper()
+        if name not in self.nodes:
+            self.get_logger().error(f'알 수 없는 노드: {name} (예: N1)')
+            return
+        nd = self.nodes[name]
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        # yaw 결정: facing 우선, 없으면 dock 방향
+        if facing is None:
+            qz, qw, yaw = _dock_yaw_quat(nd)
+        elif facing.upper() in _DIR_YAW:
+            yaw = _DIR_YAW[facing.upper()]
+            qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        elif facing.upper() in self.nodes:               # 타겟 노드 바라봄
+            t = self.nodes[facing.upper()]
+            yaw = math.atan2(t['y'] - nd['y'], t['x'] - nd['x'])
+            qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        else:
+            self.get_logger().error(f"알 수 없는 facing: {facing} (E/W/N/S 또는 노드명)")
+            return
+        msg.pose.pose.position.x = float(nd['x'])
+        msg.pose.pose.position.y = float(nd['y'])
+        msg.pose.pose.orientation.z = qz
+        msg.pose.pose.orientation.w = qw
+        # AMCL 표준 초기 공분산 (x, y, yaw)
+        msg.pose.covariance[0] = 0.25
+        msg.pose.covariance[7] = 0.25
+        msg.pose.covariance[35] = 0.0685
+        # AMCL이 확실히 수신하도록 잠깐 spin하며 여러 번 발행
+        for _ in range(3):
+            self._init_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.2)
+        self.current_node = name          # 현재 노드 기록 (다익스트라 시작점)
+        self.get_logger().info(
+            f'📍 초기 위치 설정: {name} ({nd["x"]:.3f}, {nd["y"]:.3f}) '
+            f'yaw={math.degrees(yaw):.0f}° (facing={facing or "dock"})'
+        )
+
+    def send(self, name):
+        name = name.strip().upper()
+        if name not in self.nodes:
+            self.get_logger().error(f'알 수 없는 노드: {name} (예: N5)')
+            return
+        nd = self.nodes[name]
+        if nd.get('blocked'):
+            self.get_logger().warn(f'{name}은 장애물 노드 → 보내지 않음')
+            return
+
+        if not self._ac.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error(
+                'Nav2 액션 서버(/navigate_to_pose) 없음 — Nav2 켜졌는지/도메인 확인'
+            )
+            return
+
+        h = _ROUTE_HEADING.get(name)       # 테스트 진행 방향 우선, 없으면 dock 방향(통로는 0)
+        if h:
+            yaw = _DIR_YAW[h]
+            qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        else:
+            qz, qw, yaw = _dock_yaw_quat(nd)
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(nd['x'])
+        goal.pose.pose.position.y = float(nd['y'])
+        goal.pose.pose.orientation.z = qz
+        goal.pose.pose.orientation.w = qw
+
+        self.get_logger().info(
+            f'→ {name} ({nd["x"]:.3f}, {nd["y"]:.3f}) '
+            f'yaw={math.degrees(yaw):.0f}° (dock={nd.get("dock")}) 출발'
+        )
+        t0 = time.time()
+
+        gh_future = self._ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, gh_future)
+        gh = gh_future.result()
+        if gh is None or not gh.accepted:
+            self.get_logger().error(f'{name} goal 거부됨')
+            return
+
+        res_future = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_future)
+        status = res_future.result().status
+        dt = time.time() - t0
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info(f'✅ {name} 도달 성공 ({dt:.1f}s)')
+        else:
+            self.get_logger().warn(f'❌ {name} 실패 (status={status}, {dt:.1f}s)')
+
+    # ── 직선 구간 각진 주행 (직진-회전-직진) ──────────────────────────
+    def _direction(self, a_name, b_name):
+        """두 노드 방향 → 'E'/'W'/'N'/'S' (격자 가정)."""
+        a, b = self.nodes[a_name], self.nodes[b_name]
+        dx, dy = b['x'] - a['x'], b['y'] - a['y']
+        if abs(dx) >= abs(dy):
+            return 'E' if dx > 0 else 'W'
+        return 'N' if dy > 0 else 'S'
+
+    def split_segments(self, names):
+        """노드 경로 → 직선 구간 [[방향, 끝노드], ...] (같은 방향 연속은 병합)."""
+        segs = []
+        prev = None
+        for i in range(1, len(names)):
+            d = self._direction(names[i - 1], names[i])
+            if d != prev:
+                segs.append([d, names[i]])   # 새 직선 구간(코너)
+                prev = d
+            else:
+                segs[-1][1] = names[i]        # 같은 방향 → 구간 끝 연장
+        return segs
+
+    def _set_goal_checker(self, kind):
+        """controller_server의 yaw_goal_tolerance를 런타임 변경 (loose/dock)."""
+        tol = _YAW_TOL[kind]
+        if self._cur_tol == tol:
+            return                         # 이미 그 값이면 스킵
+        if not self._param_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn('controller_server 파라미터 서비스 없음 — yaw 변경 스킵')
+            return
+        p = Parameter()
+        p.name = 'goal_checker.yaw_goal_tolerance'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(tol))
+        req = SetParameters.Request(parameters=[p])
+        fut = self._param_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=2.0)
+        self._cur_tol = tol
+        self.get_logger().info(f'   yaw 허용오차 → {math.degrees(tol):.0f}° ({kind})')
+
+    def _nav_to(self, x, y, yaw, label, goal_checker='loose'):
+        """단일 NavigateToPose goal 보내고 완료까지 대기. 성공 bool.
+
+        goal_checker: 'loose'(통로/코너, yaw 느슨) / 'dock'(작업노드, yaw 정밀)
+        """
+        qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.orientation.z = qz
+        goal.pose.pose.orientation.w = qw
+        self._set_goal_checker(goal_checker)   # goal 보내기 전 controller에 활성 goal_checker 지정
+        gh_future = self._ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, gh_future)
+        gh = gh_future.result()
+        if gh is None or not gh.accepted:
+            self.get_logger().error(f'{label} goal 거부됨')
+            return False
+        res_future = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_future)
+        return res_future.result().status == GoalStatus.STATUS_SUCCEEDED
+
+    def send_route(self, names):
+        """노드 경로를 직선 구간별로 순서 주행 (코너=제자리 회전, 직선=직진).
+
+        예: go N25 N24 N23 N22 N21 N16 N11 N6 N1
+            → 구간1 W→N21 (직진) / 구간2 N→N1 (N21서 회전 후 직진)
+        """
+        names = [n.strip().upper() for n in names]
+        for n in names:
+            if n not in self.nodes:
+                self.get_logger().error(f'알 수 없는 노드: {n}')
+                return
+            if self.nodes[n].get('blocked'):
+                self.get_logger().warn(f'{n}은 장애물 노드 → 경로 중단')
+                return
+        if len(names) < 2:
+            self.get_logger().error('경로는 노드 2개 이상 필요 (예: go N25 N21 N1)')
+            return
+        if not self._ac.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Nav2 액션 서버(/navigate_to_pose) 없음')
+            return
+        segs = self.split_segments(names)
+        self.get_logger().info(
+            f'경로 {"→".join(names)} = {len(segs)}개 직선구간: '
+            + ' | '.join(f'{d}→{end}' for d, end in segs)
+        )
+        t0 = time.time()
+        last_dock = self.nodes[names[-1]].get('dock')   # 최종 노드가 작업(dock) 노드인가
+        for k, (d, end) in enumerate(segs, 1):
+            nd = self.nodes[end]
+            is_final = (k == len(segs))
+            # 최종 구간이고 목적지가 dock 노드면 → dock 방향 + 정밀 yaw 체커
+            if is_final and last_dock:
+                dock = last_dock[0] if isinstance(last_dock, list) else last_dock
+                yaw, checker, why = _DIR_YAW[dock], 'dock', f'dock={dock} 정밀'
+            else:
+                yaw, checker, why = _DIR_YAW[d], 'loose', f'{d} 진행방향'
+            self.get_logger().info(
+                f'  [구간 {k}/{len(segs)}] → {end} ({nd["x"]:.3f}, {nd["y"]:.3f}) [{why}]'
+            )
+            if not self._nav_to(nd['x'], nd['y'], yaw, end, checker):
+                self.get_logger().warn(f'❌ 구간 {k}({end}) 실패 → 경로 중단')
+                return
+            self.current_node = end        # 구간 도착 → 현재 노드 갱신
+        self.get_logger().info(f'✅ 경로 완주: {"→".join(names)} ({time.time()-t0:.1f}s)')
+
+    # ── DIY 다익스트라 (노드/엣지 그래프) ─────────────────────────────
+    def _build_graph(self):
+        """nodes.yaml 좌표로 4-인접 그래프 자동 생성 (0.3m 이웃, blocked 제외)."""
+        free = [n for n in self.nodes if not self.nodes[n].get('blocked')]
+        self.adj = {n: [] for n in free}
+        for a in free:
+            for b in free:
+                if a == b:
+                    continue
+                dx = abs(self.nodes[a]['x'] - self.nodes[b]['x'])
+                dy = abs(self.nodes[a]['y'] - self.nodes[b]['y'])
+                if (abs(dx - 0.3) < 0.06 and dy < 0.06) or (abs(dy - 0.3) < 0.06 and dx < 0.06):
+                    self.adj[a].append((b, math.hypot(dx, dy)))
+
+    def dijkstra(self, start, goal):
+        """start→goal 최단 노드열 반환. 경로 없으면 None."""
+        pq = [(0.0, start, [start])]
+        seen = set()
+        while pq:
+            cost, node, path = heapq.heappop(pq)
+            if node == goal:
+                return path
+            if node in seen:
+                continue
+            seen.add(node)
+            for nb, w in self.adj.get(node, []):
+                if nb not in seen:
+                    heapq.heappush(pq, (cost + w, nb, path + [nb]))
+        return None
+
+    def goto(self, target):
+        """현재 노드 → target 을 다익스트라로 계산 후 구간 각진 주행."""
+        target = target.strip().upper()
+        if self.current_node is None:
+            self.get_logger().error('현재 위치 모름 → 먼저 init (예: init N25 N21)')
+            return
+        if target not in self.nodes:
+            self.get_logger().error(f'알 수 없는 노드: {target}')
+            return
+        if self.nodes[target].get('blocked'):
+            self.get_logger().warn(f'{target}은 장애물 노드')
+            return
+        if target == self.current_node:
+            self.get_logger().info(f'이미 {target}에 있음')
+            return
+        route = self.dijkstra(self.current_node, target)
+        if not route:
+            self.get_logger().error(f'{self.current_node}→{target} 경로 없음')
+            return
+        self.get_logger().info(f'🧭 다익스트라 {self.current_node}→{target}: {"→".join(route)}')
+        self.send_route(route)
+
+
+def main():
+    rclpy.init()
+    node = Nav2NodeGoal()
+    try:
+        print("명령: 'init'=기본초기화(N25향N21) / 'init N1 E'=지정초기화 / "
+              "'N24'=다익스트라 주행(현재→N24) / 'go N25 N21 N1'=명시경로 / 'q'=종료")
+        while rclpy.ok():
+            try:
+                cmd = input('node> ').strip()
+            except EOFError:
+                break
+            if cmd.lower() in ('q', 'quit', 'exit'):
+                break
+            if not cmd:
+                continue
+            parts = cmd.split()
+            if parts[0].lower() == 'init':
+                if len(parts) >= 2:
+                    facing = parts[2] if len(parts) >= 3 else None
+                    node.set_initial_pose(parts[1], facing)
+                else:
+                    node.set_initial_pose('N25', 'N21')   # 인자 없이 'init' → 기본 N25 향 N21
+            elif parts[0].lower() in ('go', 'route') and len(parts) >= 3:
+                node.send_route(parts[1:])
+            else:
+                node.goto(parts[0])
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
