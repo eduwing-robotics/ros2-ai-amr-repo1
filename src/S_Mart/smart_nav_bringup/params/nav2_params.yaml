@@ -113,18 +113,22 @@ controller_server:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.1
       movement_time_allowance: 10.0
-    # yaw_goal_tolerance는 노드 유형에 따라 런타임에 변경 (통로=느슨 0.5 / dock=정밀 0.08)
+    # yaw_goal_tolerance는 robot_fsm이 런타임에 변경.
+    # 기본 = 통로 don't-care(3.14): xy만 도착 판정, 회전은 다음 goal의 shim이 수행.
+    # dock 방향 회전 goal 직전에만 0.1(±5.7°, 마커 화각 확보용)로 조였다가 복원.
     goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.03
-      yaw_goal_tolerance: 0.5
+      yaw_goal_tolerance: 3.14
     FollowPath:
       # Rotation Shim(코너 제자리 회전) + RPP(직선 엣지 충실 추종)
       plugin: "nav2_rotation_shim_controller::RotationShimController"
       primary_controller: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       # --- Rotation Shim (코너에서 먼저 제자리 회전) ---
-      angular_dist_threshold: 0.3            # ~17°↑ 차이나면 회전 먼저
+      # 0.05 = 오버슛(0.025)보다 크고 AMCL yaw 노이즈(~0.02-0.05) 바로 위 — 하한값.
+      # 코너에서 재회전 떨림 보이면 0.08~0.1로 올릴 것.
+      angular_dist_threshold: 0.05           # ~2.9°까지 정렬 후 출발 (최대한 회전-직진)
       forward_sampling_distance: 0.2         # 노드 간격(0.3)보다 작게 — 다음 엣지 방향 정렬
       simulate_ahead_time: 1.0
       # --- 공통(shim+RPP): 제자리 회전 속도/가속 ---
