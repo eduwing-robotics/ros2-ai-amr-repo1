@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>smart_robot_bringup</name>
+  <version>0.0.1</version>
+  <description>S-Mart 로봇 측 브링업 — TB3 하드웨어 + robot_localization EKF(휠+IMU 융합)
+  한 방 기동. TB3 자체 odom TF는 끄고 EKF가 odom→base_footprint를 발행.</description>
+  <maintainer email="difj3839@gmail.com">gustn</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>turtlebot3_bringup</exec_depend>
+  <exec_depend>robot_localization</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
