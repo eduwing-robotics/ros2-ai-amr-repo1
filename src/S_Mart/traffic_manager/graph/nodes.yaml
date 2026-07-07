@@ -1,0 +1,34 @@
+# 5x5 노드 좌표 (map 프레임) — new_map 기준 (res 0.05, origin [-0.861,-0.939])
+# 기본 0.30m 간격. 단 서쪽 세로줄(N1/N6/N11/N16/N21)은 랙 도킹 거리 확보를 위해
+# 벽쪽 5cm 이동 (x 0.014 → -0.036, 2026-07-07) — 1열↔2열 가로 간격 0.35m
+# (인접 판정 허용 0.36m 안, graph.py _TOL 참조. 추가 이동 시 연결 끊김 주의!)
+# blocked: 중앙 장애물 벽 3개에 가려진 노드 (N7/N8, N15, N17/N18). 랜드마크는 노드 위 아님.
+# dock: 작업 도킹 방향 (E=오른쪽 / W=왼쪽 / N=위 / S=아래).
+# 역할 배치 (2026-06-30, 새 맵 기준 — 이전 대비 좌우 반전):
+#   냉장랙=N1,N6(W) / 냉동랙=N16,N21(W) / 출고=N5(E,N 2공간) / 입고=N10(E) / home_B=N20(E) / home_A=N25(E)
+nodes:
+  N1:  {x:  -0.006, y:  1.136, role: rack_chilled, dock: W,      blocked: false}
+  N2:  {x:  0.314, y:  1.136, role: corridor,                   blocked: false}
+  N3:  {x:  0.614, y:  1.136, role: corridor,                   blocked: false}
+  N4:  {x:  0.914, y:  1.136, role: corridor,                   blocked: false}
+  N5:  {x:  1.214, y:  1.136, role: outbound,     dock: [E, N], blocked: false}
+  N6:  {x:  -0.006, y:  0.836, role: rack_chilled, dock: W,      blocked: false}
+  N7:  {x:  0.314, y:  0.836, role: obstacle,                   blocked: true}
+  N8:  {x:  0.614, y:  0.836, role: obstacle,                   blocked: true}
+  N9:  {x:  0.914, y:  0.836, role: corridor,                   blocked: false}
+  N10: {x:  1.214, y:  0.836, role: inbound,      dock: E,      blocked: false}
+  N11: {x:  -0.006, y:  0.536, role: corridor,                   blocked: false}
+  N12: {x:  0.314, y:  0.536, role: corridor,                   blocked: false}
+  N13: {x:  0.614, y:  0.536, role: corridor,                   blocked: false}
+  N14: {x:  0.914, y:  0.536, role: corridor,                   blocked: false}
+  N15: {x:  1.214, y:  0.536, role: obstacle,                   blocked: true}
+  N16: {x:  -0.006, y:  0.236, role: rack_frozen,  dock: W,      blocked: false}
+  N17: {x:  0.314, y:  0.236, role: obstacle,                   blocked: true}
+  N18: {x:  0.614, y:  0.236, role: obstacle,                   blocked: true}
+  N19: {x:  0.914, y:  0.236, role: corridor,                   blocked: false}
+  N20: {x:  1.214, y:  0.236, role: home_B,       dock: E,      blocked: false}
+  N21: {x:  -0.006, y: -0.064, role: rack_frozen,  dock: W,      blocked: false}
+  N22: {x:  0.314, y: -0.064, role: corridor,                   blocked: false}
+  N23: {x:  0.614, y: -0.064, role: corridor,                   blocked: false}
+  N24: {x:  0.914, y: -0.064, role: corridor,                   blocked: false}
+  N25: {x:  1.214, y: -0.064, role: home_A,       dock: E,      blocked: false}
