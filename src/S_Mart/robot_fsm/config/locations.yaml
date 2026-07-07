@@ -1,0 +1,25 @@
+# location_id → 작업 노드/층/도킹 방향 매핑 (로봇 측 단일 참조)
+# ★ location_id는 DB locations 시드와 반드시 일치해야 함 (서버 팀원과 계약)
+#
+# 냉장(A창고) 랙 = N1, N6 / 냉동(B창고) 랙 = N16, N21 — 각 랙 L1(하층)/L2(상층)
+# 게이트: 입고 IN-1(N10/E), 출고 2공간 OUT-1(N5/E)·OUT-2(N5/N) — 노드는 N5 하나,
+#   dock 방향이 곧 공간 구분. 노드 예약이 N5 하나라 두 공간 서비스는 순차.
+# level: 포크 시퀀스 선택 (fork.py pick/place_sequence). 게이트는 바닥 팔레트 = 1.
+locations:
+  A1-L1: {node: N1,  level: 1, dock: W}
+  A1-L2: {node: N1,  level: 2, dock: W}
+  A2-L1: {node: N6,  level: 1, dock: W}
+  A2-L2: {node: N6,  level: 2, dock: W}
+  B1-L1: {node: N16, level: 1, dock: W}
+  B1-L2: {node: N16, level: 2, dock: W}
+  B2-L1: {node: N21, level: 1, dock: W}
+  B2-L2: {node: N21, level: 2, dock: W}
+  IN-1:  {node: N10, level: 1, dock: E}
+  OUT-1: {node: N5,  level: 1, dock: E}
+  OUT-2: {node: N5,  level: 1, dock: N}
+
+# 로봇별 홈 노드 (RETURNING 목적지) + 대기 방향.
+# 후진 도킹으로 홈 진입 → 정차 시 코가 통로(서쪽)를 봄. auto_init도 이 방향 전제.
+homes:
+  AMR_1: {node: N25, dock: W}   # N24 방향
+  AMR_2: {node: N20, dock: W}   # N19 방향
