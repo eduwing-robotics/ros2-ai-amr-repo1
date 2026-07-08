@@ -1,9 +1,12 @@
 amcl:
   ros__parameters:
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
+    # alpha 0.2→0.1: EKF(휠+IMU) 융합 오도메트리 전제 — 기본 0.2는 "휠 오돔 부정확" 가정이라
+    # 갱신마다 파티클 과산포. 실측: 0.2에서 σx 15-24cm/σyaw 9-11° → 0.1에서 σx ~5cm/σyaw ~4.8°
+    # (dock yaw tol 0.1rad=5.7° 판정 안정권 진입, 2026-07-08)
+    alpha1: 0.1
+    alpha2: 0.1
+    alpha3: 0.1
+    alpha4: 0.1
     alpha5: 0.2
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.5
@@ -16,7 +19,7 @@ amcl:
     laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 60
+    max_beams: 120                # 60→120: 빔 2배 — 갱신당 구속력 강화 (timeout 무관 확인, 복원)
     max_particles: 2000
     min_particles: 500
     odom_frame_id: "odom"
@@ -27,14 +30,16 @@ amcl:
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.2
+    sigma_hit: 0.1                # 0.2→0.1: 벽 매칭 허용 오차 축소
     tf_broadcast: true
     transform_tolerance: 0.5
-    update_min_a: 0.1
-    update_min_d: 0.1
-    z_hit: 0.5
+    update_min_a: 0.05            # 0.1→0.05: ~3°마다 갱신
+    update_min_d: 0.05            # 0.1→0.05: 5cm마다 갱신 (불확실성 누적 축소)
+    z_hit: 0.9                    # 0.5→0.9: 깨끗한 아레나 — 스캔 신뢰 강화
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.1                   # 0.5→0.1: 랜덤 노이즈 가정 축소 (파티클 조임)
+                                  # ↑실측 근거: 완화값(0.5/0.5)에서 yaw σ≈10°(cov 0.0303) — dock yaw tol
+                                  #  0.1rad(5.7°)·shim 0.1보다 커서 회전 사냥 유발. 조인 값으로 σ 축소 필수.
     z_short: 0.05
     scan_topic: scan
     map_topic: map
@@ -49,6 +54,8 @@ amcl:
 
 bt_navigator:
   ros__parameters:
+    odom_topic: "odometry/filtered"   # EKF 융합 속도 (smart_robot_bringup 전제.
+                                      # 순정 turtlebot3_bringup으로 돌아가면 "odom"으로)
     global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.5
@@ -101,7 +108,11 @@ docking_server:
 controller_server:
   ros__parameters:
     controller_frequency: 10.0
-    costmap_update_timeout: 1.5   # 0.3 → 1.5 (지연 스캔/TF로 costmap 갱신 늦어도 하드실패 대신 대기)
+    odom_topic: "odometry/filtered"   # EKF 융합 속도 — 각속도가 IMU 융합이라 휠 역산보다 깨끗
+                                      # (shim closed-loop 회전·RPP가 사용. 순정 브링업 복귀 시 "odom"으로)
+    costmap_update_timeout: 1.0   # 10.0→1.0: 10.0은 원격 nav 시절 2차 증상(클리어→재구축 실패)
+                                  # 버티기용 반창고였음. nav가 로봇 로컬(costmap 5Hz 안정)인 지금은
+                                  # 갱신 5회분 여유면 충분 — 진짜 장애면 빨리 실패해 recovery로 (기본 0.3)
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -110,8 +121,12 @@ controller_server:
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath"]
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
+      # Simple→Pose: Simple은 병진 0.1m만 진행으로 인정 — 제자리 회전은 진행 0.
+      # dock 180° 회전(0.2rad/s ≈ 15.7s)이 10s 컷에 잘려 "Failed to make progress"
+      # → recovery costmap 클리어 → "Costmap timed out" 악순환의 1차 트리거였음.
+      plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.1
+      required_movement_angle: 0.3   # 10s 안에 0.3rad(~17°)만 돌아도 진행 인정
       movement_time_allowance: 10.0
     # yaw_goal_tolerance는 robot_fsm이 런타임에 변경.
     # 기본 = 통로 don't-care(3.14): xy만 도착 판정, 회전은 다음 goal의 shim이 수행.
@@ -119,8 +134,9 @@ controller_server:
     goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.03
-      yaw_goal_tolerance: 3.14
+      xy_goal_tolerance: 0.05   # AMCL σ(y 6-7cm)에 맞춰 완화 — 목적지에 서 있어도
+                                # 서 있는데도 미도착 판정 + costmap timeout. AMCL σ에 맞춰 완화
+      yaw_goal_tolerance: 3.14  # 0.5 → 3.14 (통로 don't-care)
     FollowPath:
       # Rotation Shim(코너 제자리 회전) + RPP(직선 엣지 충실 추종)
       plugin: "nav2_rotation_shim_controller::RotationShimController"
@@ -128,11 +144,22 @@ controller_server:
       # --- Rotation Shim (코너에서 먼저 제자리 회전) ---
       # 0.05 = 오버슛(0.025)보다 크고 AMCL yaw 노이즈(~0.02-0.05) 바로 위 — 하한값.
       # 코너에서 재회전 떨림 보이면 0.08~0.1로 올릴 것.
-      angular_dist_threshold: 0.05           # ~2.9°까지 정렬 후 출발 (최대한 회전-직진)
+      angular_dist_threshold: 0.05           # ~2.9°까지 정렬 후 출발 (회전-직진 유지).
+                                             # 0.1로 올리면 5.7° 덜 돌고 출발 → RPP가 주행 중 보정 → 곡선 경로.
+                                             # 전제: AMCL 정밀화(yaw σ ~0.02-0.05) + PoseProgressChecker 안전망.
+      angular_disengage_threshold: 0.04      # ★회전 '유지' 기준 — 미설정 시 기본 0.3925(22.5°)!
+                                             # 기본값이면 22.5° 남기고 회전 중단 → RPP가 차처럼 곡선 보정(U턴 원인).
+                                             # dist_threshold(시작 0.05)보다 살짝 작게 → 끝까지 돌고 직진.
+      rotate_to_heading_once: true           # ★기본 false = 1Hz 재계획마다 회전 재판단 → 직진 중
+                                             # 순간 yaw 오차>2.9°면 매초 멈춤-회전 스터터. true = goal이
+                                             # 바뀔 때만 회전 판단 (진행 중 회전은 in_rotation_이 보호).
       forward_sampling_distance: 0.2         # 노드 간격(0.3)보다 작게 — 다음 엣지 방향 정렬
-      simulate_ahead_time: 1.0
+      simulate_ahead_time: 0.0   # 회전 충돌 미리보기 OFF — 협소부(N6/N16) 회전 거부 방지.
+                                 # 주의: 회전 중 충돌 검사 없음 — 노드/엣지 주행 + AMCL 정밀화 전제
+      rotate_to_goal_heading: true   # 최종 도킹 yaw 정렬을 shim이 담당 (RPP 대신).
+                                     # shim 회전은 미리보기 0이라 충돌검사 부담 없음
       # --- 공통(shim+RPP): 제자리 회전 속도/가속 ---
-      rotate_to_heading_angular_vel: 0.4     # 코너 제자리 회전 속도
+      rotate_to_heading_angular_vel: 0.4     # 코너 제자리 회전 속도 (180° ≈ 7.9s)
       max_angular_accel: 3.2
       # --- RPP (직선 엣지 추종) ---
       desired_linear_vel: 0.12               # 최대 전진 속도 (0.07 → 0.12)
@@ -145,7 +172,8 @@ controller_server:
       use_cost_regulated_linear_velocity_scaling: true # 장애물 근처 감속
       regulated_linear_scaling_min_radius: 0.3
       regulated_linear_scaling_min_speed: 0.03
-      use_rotate_to_heading: true            # 최종 goal yaw(dock 방향)로 제자리 정렬
+      use_rotate_to_heading: false           # RPP 자체 최종회전 OFF — shim이 담당(rotate_to_goal_heading)
+                                             # RPP 회전 중 costmap 충돌검사가 timeout 유발했음
       rotate_to_heading_min_angle: 0.5
       allow_reversing: false
       max_robot_pose_search_dist: 1.0
@@ -162,11 +190,18 @@ local_costmap:
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
+      # EKF TF는 TB3 직발행보다 지연/지터가 큼 — 기본 0.3이면 스캔 변환이
+      # 간헐 실패해 costmap 갱신 정체 → controller "Costmap timed out" 정지
+      transform_tolerance: 0.5   # 기본 0.3 → 0.5
       rolling_window: true
       width: 3
       height: 3
       resolution: 0.05
-      footprint: "[[0.15, 0.07], [0.15, -0.07], [-0.10, -0.07], [-0.10, 0.07]]"
+      # 8각형 이력: 25×14 사각형 → 22×17.8 사각형 → 실측 8각형(스윕 12.1)
+      # → 축소 8각형(현재): 전장 18/바퀴 폭 17.8/앞뒤 모서리 폭 10cm — 회전 스윕 10.3cm.
+      # N6·N16(랙+N7/N17 돌출벽 사이 협소부) 회전 확보용 의도적 과소 —
+      # 실물 앞뒤 1cm·플레이트 모서리는 미커버 (노드/엣지 주행 + AMCL 정밀화 전제)
+      footprint: "[[0.03, 0.03], [0.03, -0.03], [-0.03, -0.03], [-0.03, 0.03]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -198,7 +233,11 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       transform_tolerance: 0.5
-      footprint: "[[0.15, 0.07], [0.15, -0.07], [-0.10, -0.07], [-0.10, 0.07]]"
+      # 8각형 이력: 25×14 사각형 → 22×17.8 사각형 → 실측 8각형(스윕 12.1)
+      # → 축소 8각형(현재): 전장 18/바퀴 폭 17.8/앞뒤 모서리 폭 10cm — 회전 스윕 10.3cm.
+      # N6·N16(랙+N7/N17 돌출벽 사이 협소부) 회전 확보용 의도적 과소 —
+      # 실물 앞뒤 1cm·플레이트 모서리는 미커버 (노드/엣지 주행 + AMCL 정밀화 전제)
+      footprint: "[[0.03, 0.03], [0.03, -0.03], [-0.03, -0.03], [-0.03, 0.03]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -370,7 +409,7 @@ collision_monitor:
         theta_max: 1.0
     observation_sources: ["scan"]
     scan:
-      source_timeout: 0.5   # 0.2 → 0.5 (스캔 ~220ms 지연 흡수, 멈칫 방지)
+      source_timeout: 1.0   # 0.2 → 0.5 -> 1.0(스캔 ~220ms 지연 흡수, 멈칫 방지)
       type: "scan"
       topic: "/scan"
       enabled: true
@@ -386,7 +425,7 @@ velocity_smoother:
     velocity_timeout: 1.0
     max_accel: [2.5, 0.0, 3.2]
     max_decel: [-2.5, 0.0, -3.2]
-    odom_topic: "odom"
+    odom_topic: "odometry/filtered"   # OPEN_LOOP라 미사용 — EKF 모드 일관성용
     odom_duration: 0.1
     use_realtime_priority: false
     enable_stamped_cmd_vel: true
