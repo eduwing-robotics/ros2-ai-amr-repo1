@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>smart_domain_bridge</name>
+  <version>0.0.1</version>
+  <description>S-Mart 도메인 브릿지 — 서버(도메인 12)와 로봇(30/31) 사이 조율 토픽
+  (traffic request/response)만 중계. scan/odom/nav2는 각 로봇 도메인 내부에 유지.</description>
+  <maintainer email="difj3839@gmail.com">gustn</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>domain_bridge</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

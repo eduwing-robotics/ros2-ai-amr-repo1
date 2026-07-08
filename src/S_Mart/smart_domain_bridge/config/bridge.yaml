@@ -1,0 +1,79 @@
+# domain_bridge 설정 — 서버(12) ↔ 로봇1(30)/로봇2(31)
+# 키 = 실제 토픽명(앞 슬래시 없이). from_domain/to_domain은 토픽 아래.
+# 같은 토픽의 중복 키는 domain_bridge 공식 지원 (예제 참고) — 전부 처리됨.
+name: smart_traffic_bridge
+topics:
+  # 로봇 → 서버: 요청 (30->12, 31->12)
+  traffic/request:
+    type: std_msgs/msg/String
+    from_domain: 30
+    to_domain: 12
+  traffic/request:
+    type: std_msgs/msg/String
+    from_domain: 31
+    to_domain: 12
+
+  # 로봇 → 서버: 위치 (30->12, 31->12)
+  traffic/pose:
+    type: std_msgs/msg/String
+    from_domain: 30
+    to_domain: 12
+  traffic/pose:
+    type: std_msgs/msg/String
+    from_domain: 31
+    to_domain: 12
+
+  # 서버 → 로봇: 응답 (12->30, 12->31)
+  traffic/response/AMR_1:
+    type: std_msgs/msg/String
+    from_domain: 12
+    to_domain: 30
+  traffic/response/AMR_2:
+    type: std_msgs/msg/String
+    from_domain: 12
+    to_domain: 31
+
+  # 서버 → 로봇: 임무 배정 (12->30, 12->31) — 로봇이 robot_id로 필터
+  assignment:
+    type: std_msgs/msg/String
+    from_domain: 12
+    to_domain: 30
+  assignment:
+    type: std_msgs/msg/String
+    from_domain: 12
+    to_domain: 31
+
+  # 로봇 → 서버: 임무 보고 (픽/플레이스 시퀀스 완료 시)
+  task_report:
+    type: std_msgs/msg/String
+    from_domain: 30
+    to_domain: 12
+  task_report:
+    type: std_msgs/msg/String
+    from_domain: 31
+    to_domain: 12
+
+  # 로봇 → 서버: 상태 (1Hz busy/idle/error) — 로봇은 /robot_status로만 발행,
+  # 서버 쪽에서 fleet이 기대하는 /AMR_x/robot_status로 remap
+  robot_status:
+    type: std_msgs/msg/String
+    from_domain: 30
+    to_domain: 12
+    remap: AMR_1/robot_status
+  robot_status:
+    type: std_msgs/msg/String
+    from_domain: 31
+    to_domain: 12
+    remap: AMR_2/robot_status
+
+  # 로봇 → 서버: 배터리 (TB3 기본 발행 그대로 remap)
+  battery_state:
+    type: sensor_msgs/msg/BatteryState
+    from_domain: 30
+    to_domain: 12
+    remap: AMR_1/battery_state
+  battery_state:
+    type: sensor_msgs/msg/BatteryState
+    from_domain: 31
+    to_domain: 12
+    remap: AMR_2/battery_state
