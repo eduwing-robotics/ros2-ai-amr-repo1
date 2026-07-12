@@ -1,14 +1,21 @@
 """TrafficManager — route + index 기반 예약 관리 (교착 감지는 별도 단계).
 
+전체 경로 예약 + 예약 반영 라우팅 (B안 — A/B 검증 후 2026-07-12 채택.
+A안(corner-cap)은 git 히스토리 참조, 비교 데이터는 Gazebo/traffic_results):
+
 핵심 개념:
-- 경로는 항상 순수 최단(다익스트라, 예약 미반영). 작업노드 사이 페널티/홈 엣지
+- 라우팅: 다익스트라 + 남이 예약한 노드행 엣지 비용 2배(소프트 페널티, router.py)
+  → 교차가 심할수록 예약 구간을 애초에 우회. 작업노드 사이 페널티/홈 엣지
   차단은 그래프 비용에 이미 반영.
 - 예약 테이블: node -> robot_id (누가 점유 중).
-- reserve_forward: 경로를 따라 "직진 끝(코너) 또는 예약 가능한 곳"까지만 확보.
-  → 예약 단위 = 주행 단위 = 직선 run. (코너 캡: 코너 너머는 안 쥠 → 독점 최소화)
-- next_segment: 확보된 구간을 그대로 반환 (구조상 항상 직선 — 분할 불필요).
-- arrive/update_position: 통과한 뒤 노드 즉시 release. 멈춘 로봇은 항상 자기
-  현재 노드 하나만 점유 → 로봇 2대의 모든 상호 차단이 head-on으로 수렴 (감지 완전).
+- reserve_forward: 경로 설정 시 '경로 전체'를 즉시 예약. 남의 예약에 막히면
+  거기까지만 — 이후 next_segment마다 재시도. (대피 중엔 대피 노드까지만,
+  hold 중엔 동결 — 메서드 주석 참조)
+- next_segment: 예약은 전체지만 주행 계약은 불변 — FSM은 직선 run 단위,
+  첫 코너에서 잘라 반환.
+- arrive/update_position: 통과한 뒤 노드 즉시 release. 대기 로봇은 예약을
+  소진한 상태라 발밑만 점유 → 양쪽 대기 교착은 head-on으로 수렴 (감지 완전,
+  A안과 등가 — 분석 증명 2026-07-10).
 
 교착 해소 = 대피(back-off):
 - head-on 감지 시 양쪽의 "대피 비용"(상대의 현재+남은 경로 밖 최근접 노드까지
@@ -82,19 +89,27 @@ class TrafficManager:
         del self._hold[robot_id]
         return False
 
+    def _others(self, robot_id):
+        """남이 예약 중인 노드 집합 (라우팅 소프트 페널티 대상)."""
+        return {n for n, r in self.reservations.items() if r != robot_id}
+
     # ── 경로 설정 ─────────────────────────────────────────
     def set_route(self, robot_id, start, goal, laden=False, blocked=None,
                   blocked_edges=None):
-        """다익스트라로 경로 생성 → 저장. 시작 노드 즉시 예약. 성공 bool.
+        """페널티 반영 다익스트라로 경로 생성 → 저장 → 전체 즉시 예약. 성공 bool.
 
         laden: 팔레트 적재 여부.
         blocked / blocked_edges: 폴백 우회용 탐색 제약 (평상시 None).
         """
-        route = self.router.shortest_path(start, goal, blocked=blocked,
-                                          blocked_edges=blocked_edges)
+        route = self.router.shortest_path(
+            start, goal, blocked=blocked, blocked_edges=blocked_edges,
+            penalized=self._others(robot_id))
         if not route:
             return False
-        return self._install_route(robot_id, route, laden)
+        if not self._install_route(robot_id, route, laden):
+            return False
+        self.reserve_forward(robot_id)       # 경로 전체 즉시 확보
+        return True
 
     def _install_route(self, robot_id, route, laden):
         """계산된 route를 로봇에 장착. 기존 예약(현재 위치 제외) 정리. 성공 bool."""
@@ -110,35 +125,34 @@ class TrafficManager:
         self.reservations[start] = robot_id
         return True
 
-    # ── 예약: 직진 끝(코너) or 예약 가능한 곳까지 (코너 캡) ─
+    # ── 예약: 경로 전체 (남의 예약 앞까지) ─────────────────
+    # 단 '대피 중'에는 대피 노드까지만 확보: 대피 경로는 자기 현재 노드를
+    # 다시 지나는 중복 꼬리(예: N4→N9→N4→N5)를 가질 수 있는데, 전체 예약으로
+    # 창을 열면 update_position이 중복 노드를 현재 위치와 매칭해 '가짜 통과'
+    # (index 점프 + escape_end 조기 해제 + 예약 오염 → 양쪽 동시 양보,
+    #  유령 위치 때문에 상대가 실물 로봇 위로 라우팅). 2026-07-09 시뮬 실증.
     def reserve_forward(self, robot_id):
-        """예약 끝에서 전방으로, 같은 방향이 유지되고 비어있는 동안만 확보.
-
-        코너(방향 전환) 노드는 run의 끝으로 포함하고 그 너머는 쥐지 않는다.
-        → 확보 구간 = 항상 직선 run. 반환: 새 reserved_end.
-        """
         st = self.robots[robot_id]
-        if st.escape_end is None and self._hold_active(robot_id):
-            return st.reserved_end       # 승자 통과 대기 — 전진 예약 동결
+        if st.escape_end is not None:
+            limit = st.escape_end            # 대피 중: 대피 노드까지만
+        elif self._hold_active(robot_id):
+            limit = st.index                 # 승자 통과 대기: 전진 예약 금지
+        else:
+            limit = len(st.route) - 1        # 평시: 전체 예약
         i = st.reserved_end
-        prev_dir = None
-        while i + 1 < len(st.route):
-            d = _direction(self.graph, st.route[i], st.route[i + 1])
-            if prev_dir is not None and d != prev_dir:
-                break                    # 코너 → run 종료 (코너 노드까지 확보됨)
+        while i + 1 <= limit:
             nxt = st.route[i + 1]
             owner = self.reservations.get(nxt)
             if owner is not None and owner != robot_id:
-                break                    # 남이 점유 → 여기까지
+                break                        # 남이 점유 → 여기까지, 다음 폴링에 재시도
             self.reservations[nxt] = robot_id
-            prev_dir = d
             i += 1
         st.reserved_end = i
         return st.reserved_end
 
-    # ── 다음 주행 구간 (확보 구간 = 직선 run 그대로) ───────
+    # ── 다음 주행 구간 — 예약은 전체지만 주행 단위는 직선 run ─
     def next_segment(self, robot_id):
-        """예약된 직선 run 반환. 갈 곳 없으면 [] (대기)."""
+        """확보 구간을 첫 코너에서 잘라 반환. 갈 곳 없으면 [] (대기)."""
         st = self.robots[robot_id]
         if st.index >= len(st.route) - 1:
             st.waiting = False
@@ -148,7 +162,15 @@ class TrafficManager:
             st.waiting = True                    # 다음 노드 막힘 → 대기 표시
             return []
         st.waiting = False
-        return st.route[st.index + 1: st.reserved_end + 1]
+        j = st.index
+        prev = None
+        while j + 1 <= st.reserved_end:
+            d = _direction(self.graph, st.route[j], st.route[j + 1])
+            if prev is not None and d != prev:
+                break                            # 코너 → run 종료
+            prev = d
+            j += 1
+        return st.route[st.index + 1: j + 1]
 
     # ── 도착 / 해제 ──────────────────────────────────────
     def _advance(self, robot_id, new_index):
@@ -366,7 +388,8 @@ class TrafficManager:
             return False
         st = self.robots[robot_id]
         yielded_node = st.route[st.index]        # 내가 비켜주는 자리
-        tail = self.router.shortest_path(esc[-1], self._goal(robot_id))
+        tail = self.router.shortest_path(esc[-1], self._goal(robot_id),
+                                         penalized=self._others(robot_id))
         if not tail:
             return False
         route = esc + tail[1:]           # 대피 노드 중복 제거하고 이어붙임

@@ -1,27 +1,35 @@
-"""경로 생성 — 다익스트라 최단경로 (노드 리스트 반환).
+"""경로 생성 — 다익스트라 최단경로 + 예약 반영 소프트 페널티 (B안, 2026-07-12 채택).
 
 Graph의 인접/비용을 사용. 작업공간 랙 사이 엣지 페널티가 비용에 반영돼 있어,
 경유 트래픽은 자연히 통로로 우회한다(출발/도착이면 어쩔 수 없이 지남).
+penalized(남이 예약한 노드)로 들어가는 엣지는 비용 2배 — 막지 않고 비싸게만
+해서, 교차 압박이 높을수록 예약 구간을 우회하는 경로가 선택된다.
+(A/B 비교: 시뮬 set2 −11.8%, 실기 −8.1% makespan — Gazebo/traffic_results)
 """
 import heapq
+
+PENALTY_FACTOR = 2.0        # 남의 예약 노드행 엣지 비용 배율
 
 
 class Router:
     def __init__(self, graph):
         self.graph = graph
 
-    def shortest_path(self, start, goal, blocked=None, blocked_edges=None):
+    def shortest_path(self, start, goal, blocked=None, blocked_edges=None,
+                      penalized=None):
         """start→goal 최단 노드 리스트 반환. 없으면 None.
 
         blocked: 피할 노드 집합 (교착 리라우팅용). start/goal은 제외 안 함.
         blocked_edges: 이번 탐색에서만 안 쓸 엣지 집합 ({frozenset((a, b)), ...}).
           swap 교착용 — 목적지 자체는 막을 수 없으니 직행 엣지만 빼서
           반대편으로 접근하는 경로를 뽑는다. 예약과 무관한 탐색 제약.
+        penalized: 소프트 페널티 노드 집합 (남이 예약 중) — 진입 엣지 비용 2배.
         (blocked/미존재 노드는 None.)
         """
         g = self.graph
         block = set(blocked) if blocked else set()
         edges = blocked_edges or set()
+        pen = penalized or set()
         block.discard(start)               # 출발/도착은 막지 않음
         block.discard(goal)
         if not g.exists(start) or not g.exists(goal):
@@ -45,7 +53,7 @@ class Router:
                     continue
                 if frozenset((node, nb)) in edges:  # swap: 직행 엣지 회피
                     continue
-                nc = cost + w
+                nc = cost + (w * PENALTY_FACTOR if nb in pen else w)
                 if nc < best.get(nb, float('inf')):
                     best[nb] = nc
                     heapq.heappush(pq, (nc, nb, path + [nb]))

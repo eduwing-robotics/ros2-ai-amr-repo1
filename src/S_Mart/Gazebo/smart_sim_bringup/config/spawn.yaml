@@ -1,0 +1,17 @@
+# 로봇 스폰 위치 — 실기 홈 노드/방향 그대로 (nodes.yaml 기준)
+# 홈 대기 방향 = W (후진 도킹 전제, 코를 서쪽으로) → yaw = pi
+robots:
+  AMR_1:
+    domain: 30
+    model_name: burger1
+    node: N25            # home_A
+    x: 1.214
+    y: -0.064
+    yaw: 3.14159
+  AMR_2:
+    domain: 31
+    model_name: burger2
+    node: N20            # home_B
+    x: 1.214
+    y: 0.236
+    yaw: 3.14159
