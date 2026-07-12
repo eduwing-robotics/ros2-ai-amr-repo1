@@ -51,6 +51,36 @@ class TrafficManager:
         self.graph = router.graph
         self.robots = {}                 # robot_id -> RobotState
         self.reservations = {}           # node -> robot_id
+        # 승자 우선권(hold): 양보자 -> (승자, 비켜준 노드).
+        # 양보 취지는 "승자 먼저"인데 예약은 폴링 레이스라, 패자가 비켜준
+        # 노드를 먼저 재예약하면 재대치→재양보 반복 위험. 패자는 대피 완료
+        # 후 '승자가 그 노드를 쓸 때까지' 전진 예약을 동결한다.
+        # (B안 시뮬 실증 후 이식, 2026-07-10)
+        self._hold = {}
+
+    def _hold_active(self, robot_id):
+        """hold 유지 판정 + 조건 소멸 시 해제.
+
+        해제: ①내 복귀 경로가 그 노드를 안 지남(레이스 불가 — 즉시 출발)
+              ②승자가 통과했거나 그 위에 도착(rem[0] — 목적지인 경우 포함)
+              ③승자 경로가 바뀌어 더는 안 감.
+        대피 노드는 승자 경로 밖이므로 hold 대기가 승자를 막을 수 없음
+        → 승자는 반드시 전진 → hold는 반드시 풀림 (교착 없음)."""
+        h = self._hold.get(robot_id)
+        if h is None:
+            return False
+        winner, node = h
+        st = self.robots[robot_id]
+        if node not in st.route[st.index:]:
+            del self._hold[robot_id]
+            return False
+        st_w = self.robots.get(winner)
+        if st_w is not None:
+            rem = st_w.route[st_w.index:]
+            if node in rem and rem[0] != node:
+                return True              # 승자가 아직 접근 중 — 대기 유지
+        del self._hold[robot_id]
+        return False
 
     # ── 경로 설정 ─────────────────────────────────────────
     def set_route(self, robot_id, start, goal, laden=False, blocked=None,
@@ -88,6 +118,8 @@ class TrafficManager:
         → 확보 구간 = 항상 직선 run. 반환: 새 reserved_end.
         """
         st = self.robots[robot_id]
+        if st.escape_end is None and self._hold_active(robot_id):
+            return st.reserved_end       # 승자 통과 대기 — 전진 예약 동결
         i = st.reserved_end
         prev_dir = None
         while i + 1 < len(st.route):
@@ -333,6 +365,7 @@ class TrafficManager:
         if not esc:
             return False
         st = self.robots[robot_id]
+        yielded_node = st.route[st.index]        # 내가 비켜주는 자리
         tail = self.router.shortest_path(esc[-1], self._goal(robot_id))
         if not tail:
             return False
@@ -341,6 +374,8 @@ class TrafficManager:
             return False
         # 대피 노드 도착까지 '대피 중' 표시 — 이 로봇의 승자를 연쇄 양보에서 보호
         self.robots[robot_id].escape_end = len(esc) - 1
+        # 승자가 이 자리를 지나갈 때까지 복귀(전진 예약) 금지 — 재선점 레이스 방지
+        self._hold[robot_id] = (opponent, yielded_node)
         return True
 
     # ── 폴백: 구식 우회 (대피 불가 시) ────────────────────
