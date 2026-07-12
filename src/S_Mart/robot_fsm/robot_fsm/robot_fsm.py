@@ -20,7 +20,7 @@
 실행 (로봇에서, 각자 도메인):
     ros2 run robot_fsm robot_fsm --ros-args -p robot:=AMR_1
 사용:
-    (기동 시 자동으로 자기 홈에 AMCL 초기화 — 로봇을 홈에 놓고 켜면 됨)
+    (기동 시 자동으로 자기 홈에 AMCL 초기화 — 로봇을 홈에 dock 방향 바라보게 놓고 켜면 됨)
     fsm> init N13 E      # 홈이 아닌 곳에서 시작할 때만 수동 초기화
     fsm> init            # 홈으로 재초기화
     fsm> N22 [laden]     # (디버그) 노드 주행만 — fleet 없이 traffic 테스트용 (go 생략 가능)
@@ -45,12 +45,12 @@ from geometry_msgs.msg import PoseWithCovarianceStamped, TwistStamped
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from ament_index_python.packages import get_package_share_directory
 
 from robot_fsm import fork
 
 _DIR_YAW = {'E': 0.0, 'N': math.pi / 2, 'W': math.pi, 'S': -math.pi / 2}
-
 _DOMAIN_ROBOT = {30: 'AMR_1', 31: 'AMR_2'}   # ROS_DOMAIN_ID → 로봇 이름
 
 # yaw 톨러런스: 통로 = don't-care (xy만 도착 판정, 다음 goal이 알아서 회전),
@@ -101,6 +101,13 @@ class RobotFSM(Node):
         self._param_cli = self.create_client(
             SetParameters, '/controller_server/set_parameters')
 
+        # ── 도킹 (aruco_docking dock_controller) ──────────────
+        self._work_dock_cli = self.create_client(Trigger, '/start_work_dock')   # 작업(전진)
+        self._home_dock_cli = self.create_client(Trigger, '/start_home_dock')   # 홈(후진 180°+안착)
+        self._undock_cli = self.create_client(Trigger, '/start_undock')
+        self._estimator_param_cli = self.create_client(
+            SetParameters, '/aruco_estimator/set_parameters')
+
         # ── traffic ─────────────────────────────────────────
         self._req_pub = self.create_publisher(String, '/traffic/request', 10)
         self.create_subscription(
@@ -139,9 +146,9 @@ class RobotFSM(Node):
         while rclpy.ok() and self.current is None:
             if self._init_pub.get_subscription_count() > 0:
                 time.sleep(1.0)          # AMCL 준비 여유
-                # 초기화 후 360° 수렴 회전 — 파티클을 시작부터 조여둠
-                self.set_initial_pose(self.home['node'], self.home['dock'],
-                                      spin=True)
+                # 초기화 후 360° 수렴 회전 — 파티클을 시작부터 조여둠.
+                # 홈 자세 = dock 방향을 바라봄(의도적 설계) — 로봇을 그 방향으로 놓고 켠다.
+                self.set_initial_pose(self.home['node'], self.home['dock'], spin=True)
                 return
             time.sleep(0.5)
             waited += 0.5
@@ -286,6 +293,9 @@ class RobotFSM(Node):
         if res == 'failed':
             self._set_error('홈 복귀 실패')
             return None
+        # 홈 후진 정밀 도킹(주차). 실패해도 복귀는 완료로 처리(홈이라 ERROR까진 X).
+        if not self._home_dock():
+            self.get_logger().warn(f'[{self.robot}] 홈 도킹 실패 — 복귀는 완료 처리')
         self._state = 'IDLE'
         self.get_logger().info(f'[{self.robot}] 홈({self.home["node"]}) 복귀 완료')
         return None
@@ -389,18 +399,14 @@ class RobotFSM(Node):
         """
         seq = fork.pick_sequence(loc['level']) if pick else fork.place_sequence(loc['level'])
 
-        # 도킹 방향으로 제자리 회전 — 이 goal만 yaw 정밀(0.08)
-        nd = self.nodes[loc['node']]
-        self._set_yaw_tolerance(YAW_DOCK)
-        ok = self._nav_to(nd['x'], nd['y'], _DIR_YAW[loc['dock']])
-        self._set_yaw_tolerance(YAW_FREE)
-        if not ok:
+        # 도킹 방향으로 제자리 회전 — 이 goal만 yaw 정밀
+        if not self._face_dock(loc['node'], loc['dock']):
             self.get_logger().warn(f'[{self.robot}] {loc["node"]} 도킹 방향 회전 실패')
             return False
 
         for h in seq['before_dock']:
             self._fork(h)
-        if not self._dock():
+        if not self._work_dock(loc.get('marker')):
             return False
         for h in seq['after_dock']:
             self._fork(h)
@@ -409,6 +415,14 @@ class RobotFSM(Node):
         for h in seq['after_back']:
             self._fork(h)
         return True
+
+    def _face_dock(self, node_name, direction):
+        """도킹 방향 제자리 회전 — 이 goal만 yaw 정밀(YAW_DOCK), 끝나면 복원."""
+        nd = self.nodes[node_name]
+        self._set_yaw_tolerance(YAW_DOCK)
+        ok = self._nav_to(nd['x'], nd['y'], _DIR_YAW[direction])
+        self._set_yaw_tolerance(YAW_FREE)
+        return ok
 
     def _set_yaw_tolerance(self, tol):
         """controller_server goal_checker.yaw_goal_tolerance 런타임 변경."""
@@ -431,21 +445,68 @@ class RobotFSM(Node):
         time.sleep(0.5)
         return True
 
-    def _dock(self):
-        """[스텁] 도킹 모듈 호출 (마커 기반 PBVS 정밀 접근).
+    def _work_dock(self, marker_id=None):
+        """작업 도킹 — aruco_docking `/start_work_dock` (전진 PBVS 정밀, blocking→bool).
 
-        서비스/액션 여부는 도킹 모듈 팀원과 협의 후 확정 — 어느 쪽이든
-        이 함수 몸통만 교체 (성공 bool 반환 계약은 동일).
+        marker_id 지정 시 estimator target_marker_id를 먼저 세팅(타겟 도킹 —
+        엉뚱한 마커 방지). 실패 시 임무 실패로 전파.
         """
-        self.get_logger().info(f'[{self.robot}] [스텁] 도킹')
-        time.sleep(1.0)
-        return True
+        if marker_id is not None:
+            self._set_estimator_marker(int(marker_id))
+        self.get_logger().info(f'[{self.robot}] 작업 도킹 시작 (marker={marker_id})')
+        ok = self._call_trigger(self._work_dock_cli, '/start_work_dock', timeout=90.0)
+        if marker_id is not None:
+            self._set_estimator_marker(-1)   # 도킹 끝 → 타겟 해제 (평소=아무 마커)
+        return ok
+
+    def _home_dock(self):
+        """홈 후진 도킹 — 도크 방향 회전 후 `/start_home_dock` (정렬→180°→후진 안착).
+
+        홈은 주차라 정밀 비필요. 실패해도 ERROR 아닌 warn(복귀 자체는 완료).
+        """
+        if not self._face_dock(self.home['node'], self.home['dock']):
+            self.get_logger().warn(f'[{self.robot}] 홈 도크 방향 회전 실패')
+            return False
+        marker = self.home.get('marker')
+        if marker is not None:
+            self._set_estimator_marker(int(marker))
+        self.get_logger().info(f'[{self.robot}] 홈 도킹 시작 (marker={marker})')
+        ok = self._call_trigger(self._home_dock_cli, '/start_home_dock', timeout=90.0)
+        if marker is not None:
+            self._set_estimator_marker(-1)   # 도킹 끝 → 타겟 해제
+        return ok
 
     def _undock(self):
-        """[스텁] 언도킹 모듈 호출 (후진 back → 노드 위 복귀)."""
-        self.get_logger().info(f'[{self.robot}] [스텁] 언도킹')
-        time.sleep(1.0)
-        return True
+        """언도킹 — aruco_docking `/start_undock` (odom 후진 → 노드 복귀)."""
+        self.get_logger().info(f'[{self.robot}] 언도킹 시작')
+        return self._call_trigger(self._undock_cli, '/start_undock', timeout=40.0)
+
+    def _call_trigger(self, cli, name, timeout):
+        """Trigger 서비스 blocking 호출 → success bool. 없거나 타임아웃이면 False."""
+        if not cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error(f'[{self.robot}] {name} 서비스 없음 (dock_controller 미기동?)')
+            return False
+        res = self._await_future(cli.call_async(Trigger.Request()), timeout=timeout)
+        if res is None:
+            self.get_logger().error(f'[{self.robot}] {name} 응답 없음(타임아웃)')
+            return False
+        if not res.success:
+            self.get_logger().warn(f'[{self.robot}] {name} 실패: {res.message}')
+        return bool(res.success)
+
+    def _set_estimator_marker(self, marker_id):
+        """estimator target_marker_id 세팅(best-effort). 실패해도 진행(closest 마커 사용)."""
+        if not self._estimator_param_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn(
+                f'[{self.robot}] estimator param 서비스 없음 → target_marker_id 미설정(closest)')
+            return
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name='target_marker_id',
+            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER,
+                                 integer_value=int(marker_id)))]
+        self._await_future(self._estimator_param_cli.call_async(req), timeout=3.0)
+        self.get_logger().info(f'[{self.robot}] estimator target_marker_id={marker_id}')
 
     # ── 초기화 (CLI) ─────────────────────────────────────────
 
@@ -570,7 +631,7 @@ def main():
             p = cmd.split()
             c = p[0].lower()
             if c == 'init' and len(p) == 1:
-                # 인자 없으면 자기 홈 (locations.yaml homes)
+                # 인자 없으면 자기 홈 (locations.yaml homes) — dock 방향 바라봄
                 node.set_initial_pose(node.home['node'], node.home['dock'])
             elif c == 'init' and len(p) >= 3:
                 node.set_initial_pose(p[1], p[2])

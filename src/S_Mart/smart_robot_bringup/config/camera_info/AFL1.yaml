@@ -1,0 +1,28 @@
+image_width: 1024
+image_height: 768
+camera_name: imx219__base_soc_i2c0mux_i2c_1_imx219_10_1024x768_1640x1232_SBGGR10_CSI2P_RAW
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [820.78531018646129, 0, 508.35425611581002, 0, 822.68381741263875, 390.59280455019632, 0, 0, 1]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.21736461012686575, -0.60318938188471094, 0.0018997655027580081, 7.0153920476480103e-05, 0.50894751317353659]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [839.641845703125, 0, 507.96576632485085, 0, 0, 841.87066650390625, 391.19741387179238, 0, 0, 0, 1, 0]
+binning_x: 0
+binning_y: 0
+roi:
+  x_offset: 0
+  y_offset: 0
+  height: 0
+  width: 0
+  do_rectify: false
