@@ -10,25 +10,25 @@ nodes:
   N1:  {x:  0.014, y:  1.136, role: rack_chilled, dock: W,      blocked: false}
   N2:  {x:  0.314, y:  1.136, role: corridor,                   blocked: false}
   N3:  {x:  0.614, y:  1.136, role: corridor,                   blocked: false}
-  N4:  {x:  0.914, y:  1.136, role: corridor,                   blocked: false}
+  N4:  {x:  0.864, y:  1.136, role: corridor,                   blocked: false}
   N5:  {x:  1.214, y:  1.136, role: outbound,     dock: [E, N], blocked: false}
   N6:  {x:  0.014, y:  0.836, role: rack_chilled, dock: W,      blocked: false}
   N7:  {x:  0.314, y:  0.836, role: obstacle,                   blocked: true}
   N8:  {x:  0.614, y:  0.836, role: obstacle,                   blocked: true}
-  N9:  {x:  0.914, y:  0.836, role: corridor,                   blocked: false}
+  N9:  {x:  0.864, y:  0.836, role: corridor,                   blocked: false}
   N10: {x:  1.214, y:  0.836, role: inbound,      dock: E,      blocked: false}
   N11: {x:  0.014, y:  0.536, role: corridor,                   blocked: false}
   N12: {x:  0.314, y:  0.536, role: corridor,                   blocked: false}
   N13: {x:  0.614, y:  0.536, role: corridor,                   blocked: false}
-  N14: {x:  0.914, y:  0.536, role: corridor,                   blocked: false}
+  N14: {x:  0.864, y:  0.536, role: corridor,                   blocked: false}
   N15: {x:  1.214, y:  0.536, role: obstacle,                   blocked: true}
   N16: {x:  0.014, y:  0.236, role: rack_frozen,  dock: W,      blocked: false}
   N17: {x:  0.314, y:  0.236, role: obstacle,                   blocked: true}
   N18: {x:  0.614, y:  0.236, role: obstacle,                   blocked: true}
-  N19: {x:  0.914, y:  0.236, role: corridor,                   blocked: false}
+  N19: {x:  0.864, y:  0.236, role: corridor,                   blocked: false}
   N20: {x:  1.214, y:  0.236, role: home_B,       dock: E,      blocked: false}
   N21: {x:  0.014, y: -0.064, role: rack_frozen,  dock: W,      blocked: false}
   N22: {x:  0.314, y: -0.064, role: corridor,                   blocked: false}
   N23: {x:  0.614, y: -0.064, role: corridor,                   blocked: false}
-  N24: {x:  0.914, y: -0.064, role: corridor,                   blocked: false}
+  N24: {x:  0.864, y: -0.064, role: corridor,                   blocked: false}
   N25: {x:  1.214, y: -0.064, role: home_A,       dock: E,      blocked: false}
