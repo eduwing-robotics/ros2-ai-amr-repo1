@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""로봇 FSM — 임무 실행기 (최종 형태).
+"""로봇 FSM — 임무 실행기 (오케스트레이션).
 
 /assignment(JSON) 수신 → locations.yaml 매핑 → Traffic Manager 경로 주행
-→ 도킹/포크(스텁, 팀원 인터페이스 확정 시 교체) → /task_report 보고.
+→ 도킹/포크 → /task_report 보고.
+
+모듈 구성 (노드는 하나, 파일은 관심사·담당자 경계로 분리):
+  robot_fsm.py  이 파일 — 노드/콜백/임무 루프 + CLI·수동 주행 (오케스트레이션)
+  states.py     상태 Enum(S)·허용 전이 테이블 — FSM 설계도의 단일 소스
+  travel.py     TravelMixin: traffic 트랜잭션 + 세그먼트 주행 (nav2)
+  work.py       WorkMixin: 픽/플레이스 (도킹 서비스 + 포크 스텁)
+  amcl_init.py  AmclInitMixin: AMCL 초기 위치 발행 + 360° 수렴 회전
+  fork.py       포크 높이·시퀀스 데이터
 
 상태: IDLE → TO_SOURCE → PICK → TO_TARGET(적재) → PLACE → RETURNING → IDLE
   - PLACE 완료: target_done 보고 + 즉시 idle 발행 → fleet이 pending 배정하면
@@ -10,6 +18,7 @@
   - RETURNING 중에도 발행 상태는 idle(배정 가능) — 배정 오면 진행 중인
     세그먼트만 끝내고 경계(노드 위)에서 새 임무로 전환 (nav 취소 없음)
   - 외부 발행 상태는 busy/idle/error 3종만 (fleet 배정 판단용, 내부 상태와 분리)
+  - 상태 변경은 _set_state() 한 곳으로만 — states.TRANSITIONS 밖이면 경고
 
 토픽 (모두 로봇 도메인 — domain_bridge가 서버(12)와 중계):
   구독  /assignment            {"robot_id","source","target"} (location_id)
@@ -28,7 +37,6 @@
 ※ 자동 초기화 끄기: --ros-args -p auto_init:=false
 """
 import json
-import math
 import os
 import queue
 import sys
@@ -39,32 +47,25 @@ import yaml
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from action_msgs.msg import GoalStatus
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseWithCovarianceStamped, TwistStamped
-from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from ament_index_python.packages import get_package_share_directory
 
-from robot_fsm import fork
+from robot_fsm.states import S, TRANSITIONS, EXT_IDLE
+from robot_fsm.travel import TravelMixin
+from robot_fsm.work import WorkMixin
+from robot_fsm.amcl_init import AmclInitMixin
 
-_DIR_YAW = {'E': 0.0, 'N': math.pi / 2, 'W': math.pi, 'S': -math.pi / 2}
 _DOMAIN_ROBOT = {30: 'AMR_1', 31: 'AMR_2'}   # ROS_DOMAIN_ID → 로봇 이름
-
-# yaw 톨러런스: 통로 = don't-care (xy만 도착 판정, 다음 goal이 알아서 회전),
-# dock 방향 회전 goal에서만 정밀. nav2_params 기본값도 YAW_FREE로 맞춰둠.
-# YAW_DOCK 0.1 rad ≈ ±5.7° — 마커가 도킹 카메라 화각에 들어오면 충분,
-# 이후 정밀 정렬은 도킹 서버(마커 기반)가 담당. 실기 확인값.
-YAW_FREE = 3.14
-YAW_DOCK = 0.1
 
 # PLACE 완료 후 체이닝 배정 대기 시간(초) — 이 안에 /assignment 오면 홈 안 감
 CHAIN_WAIT = 1.5
 
 
-class RobotFSM(Node):
+class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
     def __init__(self):
         super().__init__('robot_fsm')
         # 로봇 이름 = ROS_DOMAIN_ID 자동 결정 (30→AMR_1, 31→AMR_2).
@@ -125,7 +126,7 @@ class RobotFSM(Node):
         self._resp_ev = threading.Event()
         self.current = None              # 현재(마지막 도착) 노드
         self._queue = queue.Queue()      # 수신된 /assignment 대기열
-        self._state = 'IDLE'             # IDLE/TO_SOURCE/PICK/TO_TARGET/PLACE/RETURNING/MANUAL/ERROR
+        self._state = S.IDLE             # 상태 정의·전이 = states.py
         self.get_logger().info(f'[{self.robot}] FSM 시작 (홈: {self.home["node"]})')
 
         # 기본 자동 초기화: 도메인 ID → 로봇 이름 → locations.yaml 홈으로 AMCL 초기화
@@ -156,14 +157,30 @@ class RobotFSM(Node):
                 self.get_logger().warn(
                     'auto_init 대기 중: AMCL(/initialpose 구독자) 미기동 — nav2를 켜면 자동 초기화됩니다')
 
+    # ── 상태 전이 (단일 통로) ─────────────────────────────────
+
+    def _set_state(self, new):
+        """모든 상태 변경은 여기로. states.TRANSITIONS 밖이면 경고(막지는 않음).
+
+        실기 운용 중 FSM 정지보다 잘못된 전이를 로그로 표면화하는 쪽이 안전.
+        """
+        old = self._state
+        if new is old:
+            return
+        if new not in TRANSITIONS.get(old, set()):
+            self.get_logger().warn(
+                f'[{self.robot}] 미정의 전이: {old.value} → {new.value} '
+                f'(states.TRANSITIONS 확인 필요)')
+        self._state = new
+        self.get_logger().info(f'[{self.robot}] 상태: {old.value} → {new.value}')
+
     # ── 상태 발행 ─────────────────────────────────────────────
 
     def _ext_status(self):
-        """외부 발행 상태 — fleet은 idle만 배정 대상으로 봄.
-        RETURNING도 idle: 복귀 중 배정 가능 (세그먼트 경계에서 전환)."""
-        if self._state == 'ERROR':
+        """외부 발행 상태 — fleet은 idle만 배정 대상으로 봄 (states.EXT_IDLE)."""
+        if self._state is S.ERROR:
             return 'error'
-        if self._state in ('IDLE', 'RETURNING'):
+        if self._state in EXT_IDLE:
             return 'idle'
         return 'busy'
 
@@ -205,26 +222,13 @@ class RobotFSM(Node):
         self._resp = json.loads(msg.data)
         self._resp_ev.set()
 
-    # ── traffic 요청/응답 ─────────────────────────────────────
-
-    def _transact(self, payload, timeout=10.0):
-        """요청 발행 → 응답 대기. 발행 전에 이벤트를 clear해 응답 유실 방지."""
-        payload['robot'] = self.robot
-        self._resp_ev.clear()
-        msg = String()
-        msg.data = json.dumps(payload)
-        self._req_pub.publish(msg)
-        if not self._resp_ev.wait(timeout):
-            return None
-        return self._resp
-
     # ── 임무 루프 (전용 스레드) ───────────────────────────────
 
     def mission_loop(self):
         """배정 대기 → 임무 실행 → 체이닝 or 홈 복귀. 데몬 스레드로 실행."""
         nxt = None
         while rclpy.ok():
-            if self._state == 'ERROR':
+            if self._state is S.ERROR:
                 nxt = None
                 time.sleep(0.5)          # reset 명령 대기
                 continue
@@ -256,23 +260,23 @@ class RobotFSM(Node):
         src, tgt = self.locations[a['source']], self.locations[a['target']]
         self.get_logger().info(f'[{self.robot}] 임무 시작: {a["source"]} → {a["target"]}')
 
-        self._state = 'TO_SOURCE'
+        self._set_state(S.TO_SOURCE)
         if self._travel(src['node'], laden=False) != 'done':
             return False
-        self._state = 'PICK'
+        self._set_state(S.PICK)
         if not self._work(src, pick=True):
             return False
         self._report('source_arrived')
 
-        self._state = 'TO_TARGET'
+        self._set_state(S.TO_TARGET)
         if self._travel(tgt['node'], laden=True) != 'done':
             return False
-        self._state = 'PLACE'
+        self._set_state(S.PLACE)
         if not self._work(tgt, pick=False):
             return False
         self._report('target_done')
 
-        self._state = 'IDLE'
+        self._set_state(S.IDLE)
         self._publish_status()           # 1Hz 타이머 안 기다리고 즉시 idle 발행
                                          # → fleet이 CHAIN_WAIT(1.5s) 안에 배정 가능
         self.get_logger().info(f'[{self.robot}] 임무 완료: {a["source"]} → {a["target"]}')
@@ -281,9 +285,9 @@ class RobotFSM(Node):
     def _return_home(self):
         """홈 복귀. 배정 오면 세그먼트 경계에서 중단하고 그 임무를 반환."""
         if self.current == self.home['node']:
-            self._state = 'IDLE'
+            self._set_state(S.IDLE)
             return None
-        self._state = 'RETURNING'
+        self._set_state(S.RETURNING)
         res = self._travel(self.home['node'], laden=False, preempt=True)
         if res == 'preempted':
             try:
@@ -296,286 +300,14 @@ class RobotFSM(Node):
         # 홈 후진 정밀 도킹(주차). 실패해도 복귀는 완료로 처리(홈이라 ERROR까진 X).
         if not self._home_dock():
             self.get_logger().warn(f'[{self.robot}] 홈 도킹 실패 — 복귀는 완료 처리')
-        self._state = 'IDLE'
+        self._set_state(S.IDLE)
         self.get_logger().info(f'[{self.robot}] 홈({self.home["node"]}) 복귀 완료')
         return None
 
     def _set_error(self, why):
-        self._state = 'ERROR'
+        self._set_state(S.ERROR)
         self.get_logger().error(
             f'[{self.robot}] ERROR: {why} — 배정 제외됨, 조치 후 fsm> reset')
-
-    # ── 주행 ─────────────────────────────────────────────────
-
-    def _travel(self, goal_node, laden=False, preempt=False):
-        """현재 노드 → goal_node. 경로 요청(거절 시 재시도) + 세그먼트 주행.
-
-        preempt=True(RETURNING): 배정 수신 시 세그먼트 경계에서 'preempted'.
-        반환: 'done' | 'preempted' | 'failed'
-        """
-        while rclpy.ok():                # 경로 요청 — 시작 노드 점유 등이면 재시도
-            resp = self._transact({'type': 'route', 'start': self.current,
-                                   'goal': goal_node, 'laden': laden})
-            if resp and resp.get('type') == 'route':
-                self.get_logger().info(
-                    f'[{self.robot}] 경로: {"→".join(resp["route"])}')
-                break
-            if preempt and not self._queue.empty():
-                return 'preempted'
-            self.get_logger().info(f'[{self.robot}] 경로 대기({goal_node}) — 재시도')
-            time.sleep(1.0)
-
-        while rclpy.ok():
-            if preempt and not self._queue.empty():
-                return 'preempted'       # 세그먼트 경계 = 노드 위에서만 전환
-            resp = self._transact({'type': 'segment'})
-            t = resp.get('type') if resp else None
-            if t == 'segment':
-                if not self._drive_segment(resp['nodes']):
-                    return 'failed'
-            elif t == 'wait':
-                time.sleep(1.0)
-            elif t == 'reroute':
-                self.get_logger().info(
-                    f'[{self.robot}] 우회: {"→".join(resp["route"])}')
-            elif t == 'done':
-                return 'done'
-            else:
-                self.get_logger().warn(f'[{self.robot}] traffic 응답 이상: {resp}')
-                return 'failed'
-        return 'failed'
-
-    def _drive_segment(self, seg_nodes):
-        if not self._ac.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error('nav2 액션서버 없음')
-            return False
-        # 직선 run은 끝점 goal 하나로 쭉 (중간 노드 통과, 안 멈춤).
-        # 중간 노드 release는 traffic이 amcl 위치로 처리 (로봇은 arrive 안 보냄).
-        end = seg_nodes[-1]
-        d = self._direction(self.current, seg_nodes[0])
-        nd = self.nodes[end]
-        if not self._nav_to(nd['x'], nd['y'], _DIR_YAW[d]):
-            self.get_logger().warn(f'[{self.robot}] {end} 주행 실패')
-            return False
-        self.current = end
-        return True
-
-    def _direction(self, a, b):
-        ax, ay = self.nodes[a]['x'], self.nodes[a]['y']
-        bx, by = self.nodes[b]['x'], self.nodes[b]['y']
-        dx, dy = bx - ax, by - ay
-        if abs(dx) >= abs(dy):
-            return 'E' if dx > 0 else 'W'
-        return 'N' if dy > 0 else 'S'
-
-    def _nav_to(self, x, y, yaw):
-        goal = NavigateToPose.Goal()
-        goal.pose.header.frame_id = 'map'
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
-        goal.pose.pose.position.x = float(x)
-        goal.pose.pose.position.y = float(y)
-        goal.pose.pose.orientation.z = math.sin(yaw / 2)
-        goal.pose.pose.orientation.w = math.cos(yaw / 2)
-        gh = self._await_future(self._ac.send_goal_async(goal))
-        if not gh or not gh.accepted:
-            return False
-        res = self._await_future(gh.get_result_async())
-        return res is not None and res.status == GoalStatus.STATUS_SUCCEEDED
-
-    @staticmethod
-    def _await_future(fut, timeout=120.0):
-        ev = threading.Event()
-        fut.add_done_callback(lambda _f: ev.set())
-        if not ev.wait(timeout):
-            return None
-        return fut.result()
-
-    # ── 작업 (도킹 방향 회전 + 포크/도킹 시퀀스) ──────────────
-
-    def _work(self, loc, pick):
-        """픽/플레이스 — fork.py 시퀀스 테이블 기반, 임무 타입 무관 단일 흐름.
-
-        L1은 after_back이 빈 리스트라 명령 자체가 안 나감 (개수 차이 흡수).
-        """
-        seq = fork.pick_sequence(loc['level']) if pick else fork.place_sequence(loc['level'])
-
-        # 도킹 방향으로 제자리 회전 — 이 goal만 yaw 정밀
-        if not self._face_dock(loc['node'], loc['dock']):
-            self.get_logger().warn(f'[{self.robot}] {loc["node"]} 도킹 방향 회전 실패')
-            return False
-
-        for h in seq['before_dock']:
-            self._fork(h)
-        if not self._work_dock(loc.get('marker')):
-            return False
-        for h in seq['after_dock']:
-            self._fork(h)
-        if not self._undock():
-            return False
-        for h in seq['after_back']:
-            self._fork(h)
-        return True
-
-    def _face_dock(self, node_name, direction):
-        """도킹 방향 제자리 회전 — 이 goal만 yaw 정밀(YAW_DOCK), 끝나면 복원."""
-        nd = self.nodes[node_name]
-        self._set_yaw_tolerance(YAW_DOCK)
-        ok = self._nav_to(nd['x'], nd['y'], _DIR_YAW[direction])
-        self._set_yaw_tolerance(YAW_FREE)
-        return ok
-
-    def _set_yaw_tolerance(self, tol):
-        """controller_server goal_checker.yaw_goal_tolerance 런타임 변경."""
-        if not self._param_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('controller_server 파라미터 서비스 없음 — 톨러런스 유지')
-            return
-        req = SetParameters.Request()
-        req.parameters = [Parameter(
-            name='goal_checker.yaw_goal_tolerance',
-            value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
-                                 double_value=float(tol)))]
-        self._await_future(self._param_cli.call_async(req), timeout=3.0)
-
-    # ── 스텁: 팀원 인터페이스 확정 시 교체 ─────────────────────
-
-    def _fork(self, level):
-        """[스텁] micro-ROS 포크 명령 — 절대 높이 level(0~4)로."""
-        self.get_logger().info(
-            f'[{self.robot}] [스텁] 포크 → 높이 {level} (스텝 {fork.steps(level)})')
-        time.sleep(0.5)
-        return True
-
-    def _work_dock(self, marker_id=None):
-        """작업 도킹 — aruco_docking `/start_work_dock` (전진 PBVS 정밀, blocking→bool).
-
-        marker_id 지정 시 estimator target_marker_id를 먼저 세팅(타겟 도킹 —
-        엉뚱한 마커 방지). 실패 시 임무 실패로 전파.
-        """
-        if marker_id is not None:
-            self._set_estimator_marker(int(marker_id))
-        self.get_logger().info(f'[{self.robot}] 작업 도킹 시작 (marker={marker_id})')
-        ok = self._call_trigger(self._work_dock_cli, '/start_work_dock', timeout=90.0)
-        if marker_id is not None:
-            self._set_estimator_marker(-1)   # 도킹 끝 → 타겟 해제 (평소=아무 마커)
-        return ok
-
-    def _home_dock(self):
-        """홈 후진 도킹 — 도크 방향 회전 후 `/start_home_dock` (정렬→180°→후진 안착).
-
-        홈은 주차라 정밀 비필요. 실패해도 ERROR 아닌 warn(복귀 자체는 완료).
-        """
-        if not self._face_dock(self.home['node'], self.home['dock']):
-            self.get_logger().warn(f'[{self.robot}] 홈 도크 방향 회전 실패')
-            return False
-        marker = self.home.get('marker')
-        if marker is not None:
-            self._set_estimator_marker(int(marker))
-        self.get_logger().info(f'[{self.robot}] 홈 도킹 시작 (marker={marker})')
-        ok = self._call_trigger(self._home_dock_cli, '/start_home_dock', timeout=90.0)
-        if marker is not None:
-            self._set_estimator_marker(-1)   # 도킹 끝 → 타겟 해제
-        return ok
-
-    def _undock(self):
-        """언도킹 — aruco_docking `/start_undock` (odom 후진 → 노드 복귀)."""
-        self.get_logger().info(f'[{self.robot}] 언도킹 시작')
-        return self._call_trigger(self._undock_cli, '/start_undock', timeout=40.0)
-
-    def _call_trigger(self, cli, name, timeout):
-        """Trigger 서비스 blocking 호출 → success bool. 없거나 타임아웃이면 False."""
-        if not cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error(f'[{self.robot}] {name} 서비스 없음 (dock_controller 미기동?)')
-            return False
-        res = self._await_future(cli.call_async(Trigger.Request()), timeout=timeout)
-        if res is None:
-            self.get_logger().error(f'[{self.robot}] {name} 응답 없음(타임아웃)')
-            return False
-        if not res.success:
-            self.get_logger().warn(f'[{self.robot}] {name} 실패: {res.message}')
-        return bool(res.success)
-
-    def _set_estimator_marker(self, marker_id):
-        """estimator target_marker_id 세팅(best-effort). 실패해도 진행(closest 마커 사용)."""
-        if not self._estimator_param_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn(
-                f'[{self.robot}] estimator param 서비스 없음 → target_marker_id 미설정(closest)')
-            return
-        req = SetParameters.Request()
-        req.parameters = [Parameter(
-            name='target_marker_id',
-            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER,
-                                 integer_value=int(marker_id)))]
-        self._await_future(self._estimator_param_cli.call_async(req), timeout=3.0)
-        self.get_logger().info(f'[{self.robot}] estimator target_marker_id={marker_id}')
-
-    # ── 초기화 (CLI) ─────────────────────────────────────────
-
-    def set_initial_pose(self, name, facing, spin=False):
-        """AMCL 초기 위치 발행. spin=True면 발행 후 360° 수렴 회전.
-
-        주의: 회전 '후에' 재발행하면 파티클이 리셋돼 수렴이 무효 —
-        반드시 발행 → 회전 → current 세팅 순서 유지.
-        """
-        name = name.upper()
-        nd = self.nodes[name]
-        facing = facing.upper()
-        # facing = 방향(E/W/N/S) 또는 노드명(그 노드를 바라봄)
-        if facing in _DIR_YAW:
-            yaw = _DIR_YAW[facing]
-        elif facing in self.nodes:
-            t = self.nodes[facing]
-            yaw = math.atan2(t['y'] - nd['y'], t['x'] - nd['x'])
-        else:
-            self.get_logger().error(f'알 수 없는 방향/노드: {facing} (E/W/N/S 또는 노드명)')
-            return
-        msg = PoseWithCovarianceStamped()
-        msg.header.frame_id = 'map'
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.pose.position.x = float(nd['x'])
-        msg.pose.pose.position.y = float(nd['y'])
-        msg.pose.pose.orientation.z = math.sin(yaw / 2)
-        msg.pose.pose.orientation.w = math.cos(yaw / 2)
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = 0.0685
-        for _ in range(3):
-            self._init_pub.publish(msg)
-            time.sleep(0.2)   # 백그라운드 executor가 spin 중 → sleep으로만 간격
-        if spin:
-            prev = self._state
-            self._state = 'MANUAL'       # busy 발행 → 회전 중 fleet 배정 차단
-            try:
-                time.sleep(1.0)          # AMCL 파티클 리셋 반영 여유
-                if self._spin_converge():
-                    self.get_logger().info(f'[{self.robot}] 초기 수렴 회전(360°) 완료')
-            finally:
-                self._state = prev
-        self.current = name
-        self.get_logger().info(f'[{self.robot}] 초기 위치 {name} 방향 {facing}')
-
-    SPIN_VEL = 0.4                       # 수렴 회전 각속도 (rad/s)
-
-    def _spin_converge(self):
-        """제자리 360° 회전 — cmd_vel 직접 발행 (AMCL 파티클 수렴용).
-
-        nav2 액션 없이 시간 기반 개루프: 2π/속도 동안 회전 명령 후 정지.
-        정확히 360°일 필요 없음(수렴 목적) — 홈 위 제자리 회전이라 안전.
-        """
-        duration = 2 * math.pi / self.SPIN_VEL      # ≈ 15.7초
-        msg = TwistStamped()
-        msg.twist.angular.z = self.SPIN_VEL
-        t0 = time.time()
-        while rclpy.ok() and time.time() - t0 < duration:
-            msg.header.stamp = self.get_clock().now().to_msg()
-            self._cmd_pub.publish(msg)
-            time.sleep(0.05)                        # 20Hz
-        # 정지 (확실히 여러 번)
-        msg.twist.angular.z = 0.0
-        for _ in range(5):
-            msg.header.stamp = self.get_clock().now().to_msg()
-            self._cmd_pub.publish(msg)
-            time.sleep(0.05)
-        return True
 
     # ── 디버그: 수동 노드 주행 (fleet 없이 traffic 테스트) ─────
 
@@ -583,15 +315,15 @@ class RobotFSM(Node):
         if self.current is None:
             print('먼저 init 필요')
             return
-        if self._state != 'IDLE':
-            print(f'현재 {self._state} — IDLE에서만 수동 주행 가능')
+        if self._state is not S.IDLE:
+            print(f'현재 {self._state.value} — IDLE에서만 수동 주행 가능')
             return
-        self._state = 'MANUAL'           # busy 발행 → fleet 배정 차단
+        self._set_state(S.MANUAL)        # busy 발행 → fleet 배정 차단
         try:
             res = self._travel(goal.upper(), laden=laden)
             print(f'수동 주행 결과: {res}')
         finally:
-            self._state = 'IDLE'
+            self._set_state(S.IDLE)
 
 
 def main():
@@ -644,23 +376,23 @@ def main():
                 node.manual_go(p[0], laden)
             elif c == 'spin':
                 # 수동 360° 수렴 회전 (재초기화 후 파티클 조이기용)
-                if node._state != 'IDLE':
-                    print(f'현재 {node._state} — IDLE에서만 가능')
+                if node._state is not S.IDLE:
+                    print(f'현재 {node._state.value} — IDLE에서만 가능')
                 else:
-                    node._state = 'MANUAL'
+                    node._set_state(S.MANUAL)
                     try:
                         print('수렴 회전 성공' if node._spin_converge() else '수렴 회전 실패')
                     finally:
-                        node._state = 'IDLE'
+                        node._set_state(S.IDLE)
             elif c == 'status':
-                print(f'state={node._state} current={node.current} '
+                print(f'state={node._state.value} current={node.current} '
                       f'대기임무={node._queue.qsize()}')
             elif c == 'reset':
-                if node._state == 'ERROR':
-                    node._state = 'IDLE'
+                if node._state is S.ERROR:
+                    node._set_state(S.IDLE)
                     print('IDLE 복귀 (위치 어긋났으면 init 재실행)')
                 else:
-                    print(f'ERROR 아님 (현재 {node._state})')
+                    print(f'ERROR 아님 (현재 {node._state.value})')
             else:
                 print('사용: init N25 N21 / go N1 [laden] / status / reset / q')
     finally:
