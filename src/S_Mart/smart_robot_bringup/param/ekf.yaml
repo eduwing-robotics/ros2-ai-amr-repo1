@@ -2,7 +2,12 @@
 # 전제: diff_drive_controller.odometry.publish_tf=false (burger_ekf.yaml로 오버라이드)
 ekf_filter_node:
   ros__parameters:
-    frequency: 30.0
+    # 20Hz: Pi CPU 공유(nav2와 같은 기기) 부담 완화. 소비자 전수 확인(2026-07-13):
+    # controller 10Hz·costmap 5/1Hz·AMCL(tol 0.5s) 전부 2배 이상 여유,
+    # 도킹은 raw /odom 직구독이라 무관. 유일한 얇은 지점 = Rotation Shim의
+    # "now" TF 조회(0.1s 대기 vs 발행 틈 50ms) — 간헐 U턴 재발 시
+    # transform_time_offset: 0.05 추가가 1순위 처방.
+    frequency: 20.0
     two_d_mode: true                 # 평면 로봇
     publish_tf: true
     map_frame: map
