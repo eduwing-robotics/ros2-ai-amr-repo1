@@ -22,6 +22,10 @@ _DIR_YAW = {'E': 0.0, 'N': math.pi / 2, 'W': math.pi, 'S': -math.pi / 2}
 YAW_FREE = 3.14
 YAW_DOCK = 0.1
 
+# 세그먼트 주행 중 nav2 recovery(Wait)가 이 횟수 도달 = 지속 장애물 확정 → 재경로.
+# BT의 RecoveryNode number_of_retries=6보다 작아야 abort 전에 감지 (4 < 6).
+RECOVERY_BLOCK = 4
+
 
 class TravelMixin:
 
@@ -64,11 +68,25 @@ class TravelMixin:
             resp = self._transact({'type': 'segment'})
             t = resp.get('type') if resp else None
             if t == 'segment':
-                if not self._drive_segment(resp['nodes']):
+                outcome = self._drive_segment(resp['nodes'])
+                if outcome == 'blocked':
+                    # 지속 장애물 감지 → traffic에 보고 → 엣지 차단 + 재경로
+                    r = self._transact({'type': 'blocked'})
+                    if r and r.get('type') == 'reroute':
+                        self.current = r['route'][0]   # traffic index로 동기화(엣지 중간→노드)
+                        self.get_logger().warn(
+                            f'[{self.robot}] 장애물 우회: {"→".join(r["route"])}')
+                    else:                               # wait(목적지 막힘 or 우회로 없음) or None
+                        self.get_logger().warn(
+                            f'[{self.robot}] 장애물 — 대기 (사람이 치울 때까지)')
+                        time.sleep(1.0)
+                elif outcome == 'failed':
                     return 'failed'
+                # 'done' → 계속
             elif t == 'wait':
                 time.sleep(1.0)
             elif t == 'reroute':
+                self.current = resp['route'][0]         # 로봇B 선제 우회 동기화
                 self.get_logger().info(
                     f'[{self.robot}] 우회: {"→".join(resp["route"])}')
             elif t == 'done':
@@ -79,19 +97,53 @@ class TravelMixin:
         return 'failed'
 
     def _drive_segment(self, seg_nodes):
+        """직선 run 주행 (recovery 감시 포함). 반환: 'done' | 'failed' | 'blocked'."""
         if not self._ac.wait_for_server(timeout_sec=5.0):
             self.get_logger().error('nav2 액션서버 없음')
-            return False
+            return 'failed'
         # 직선 run은 끝점 goal 하나로 쭉 (중간 노드 통과, 안 멈춤).
         # 중간 노드 release는 traffic이 amcl 위치로 처리 (로봇은 arrive 안 보냄).
         end = seg_nodes[-1]
         d = self._direction(self.current, seg_nodes[0])
         nd = self.nodes[end]
-        if not self._nav_to(nd['x'], nd['y'], _DIR_YAW[d]):
-            self.get_logger().warn(f'[{self.robot}] {end} 주행 실패')
-            return False
-        self.current = end
-        return True
+        outcome = self._nav_monitored(nd['x'], nd['y'], _DIR_YAW[d])
+        if outcome == 'done':
+            self.current = end
+            return 'done'
+        if outcome == 'blocked':
+            self.get_logger().warn(
+                f'[{self.robot}] {end} 방향 지속 장애물 (recovery {RECOVERY_BLOCK}회)')
+            return 'blocked'
+        self.get_logger().warn(f'[{self.robot}] {end} 주행 실패')
+        return 'failed'
+
+    def _nav_monitored(self, x, y, yaw):
+        """NavigateToPose 주행 + recovery 감시. 반환: 'done'|'failed'|'blocked'.
+
+        feedback.number_of_recoveries가 RECOVERY_BLOCK 도달 = wait-only recovery가
+        그만큼 못 뚫음 = 지속 장애물 → goal 취소하고 'blocked' (→ 위상적 우회).
+        """
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.orientation.z = math.sin(yaw / 2)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2)
+        fb = {'n': 0}
+        gh = self._await_future(self._ac.send_goal_async(
+            goal, feedback_callback=lambda m: fb.update(n=m.feedback.number_of_recoveries)))
+        if not gh or not gh.accepted:
+            return 'failed'
+        result_fut = gh.get_result_async()
+        ev = threading.Event()
+        result_fut.add_done_callback(lambda _f: ev.set())
+        while not ev.wait(0.2):                       # 0.2s마다 recovery 감시
+            if fb['n'] >= RECOVERY_BLOCK:
+                self._await_future(gh.cancel_goal_async(), timeout=5.0)
+                return 'blocked'
+        res = result_fut.result()
+        return 'done' if (res and res.status == GoalStatus.STATUS_SUCCEEDED) else 'failed'
 
     def _direction(self, a, b):
         ax, ay = self.nodes[a]['x'], self.nodes[a]['y']

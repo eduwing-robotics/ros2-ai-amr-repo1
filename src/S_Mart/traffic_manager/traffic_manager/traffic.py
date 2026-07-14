@@ -51,7 +51,9 @@ class RobotState:
 
 
 class TrafficManager:
-    ARRIVE_RADIUS = 0.12                  # 노드 통과 판정 반경(m)
+    ARRIVE_RADIUS = 0.07                  # 노드 통과 판정 반경(m). 0.12→0.07:
+                                          # 저속 정지(~0.12m) 시 접근 노드를 조기 "통과" 오인
+                                          # → 장애물 재경로 출발점 꼬임 방지. 3Hz 샘플 바닥(0.03) 위.
 
     def __init__(self, router):
         self.router = router
@@ -64,6 +66,56 @@ class TrafficManager:
         # 후 '승자가 그 노드를 쓸 때까지' 전진 예약을 동결한다.
         # (B안 시뮬 실증 후 이식, 2026-07-10)
         self._hold = {}
+        # 장애물 차단 엣지(전역): {frozenset(a,b), ...}. 로봇이 recovery로 감지 보고 시 등록.
+        # hard block(라우팅·예약에서 회피). 시간 만료 없음 — 사람이 치우고 GUI 확인 시 해제
+        # (or 수동 unblock). 장애물은 모든 로봇을 막으므로 로봇별이 아니라 전역. (2026-07-14 설계)
+        self._blocked_edges = set()
+
+    # ── 장애물 차단 엣지 (전역) ────────────────────────────
+    def block_edge(self, a, b):
+        """엣지 차단 등록 (양방향). 이후 모든 라우팅/예약이 이 엣지를 회피."""
+        self._blocked_edges.add(frozenset((a, b)))
+
+    def unblock_edge(self, a, b):
+        """엣지 차단 해제 (GUI 사람 확인 또는 수동)."""
+        self._blocked_edges.discard(frozenset((a, b)))
+
+    def clear_blocks(self):
+        """전체 차단 해제."""
+        self._blocked_edges.clear()
+
+    def _edge_blocked(self, a, b):
+        return frozenset((a, b)) in self._blocked_edges
+
+    def next_edge_blocked(self, robot_id):
+        """로봇의 다음 진행 엣지가 장애물 차단인지 (reroute 트리거 판별용)."""
+        st = self.robots.get(robot_id)
+        if st is None or st.index + 1 >= len(st.route):
+            return False
+        return self._edge_blocked(st.route[st.index], st.route[st.index + 1])
+
+    def report_obstacle(self, robot_id):
+        """로봇이 다음 엣지에서 지속 장애물 감지 → 엣지 전역 차단 + 대응 결정.
+
+        엣지는 traffic의 index 기준(route[index]→route[index+1]) — index가 0.07로 정확.
+        차단(block_edge)은 모든 경우 공통(다른 로봇 반영). 본인 대응만 갈림:
+          'reroute'      → route로 우회 (일반 엣지 장애물)
+          'goal_blocked' → 막힌 다음 노드=최종 목적지 → 우회 무의미, 대기 (사람 필요)
+          'no_route'     → 엣지 우회로 없음 → 대기 (사람 필요)
+          None           → 막을 엣지 없음 (이미 목적지 위)
+        반환: (kind, blocked_edge frozenset | None, route | None)
+        """
+        st = self.robots.get(robot_id)
+        if st is None or st.index + 1 >= len(st.route):
+            return None, None, None
+        a, b = st.route[st.index], st.route[st.index + 1]
+        self.block_edge(a, b)                    # 차단은 공통
+        edge = frozenset((a, b))
+        if b == self._goal(robot_id):            # 막힌 다음 노드 = 최종 목적지
+            return 'goal_blocked', edge, None    # 재경로 안 함 — 대기+알림
+        if self.set_route(robot_id, a, self._goal(robot_id), laden=st.laden):
+            return 'reroute', edge, list(self.robots[robot_id].route)
+        return 'no_route', edge, None            # 우회로 없음 — 대기+알림
 
     def _hold_active(self, robot_id):
         """hold 유지 판정 + 조건 소멸 시 해제.
@@ -101,8 +153,11 @@ class TrafficManager:
         laden: 팔레트 적재 여부.
         blocked / blocked_edges: 폴백 우회용 탐색 제약 (평상시 None).
         """
+        edges = set(self._blocked_edges)     # 장애물 차단(전역) 항상 반영
+        if blocked_edges:
+            edges |= set(blocked_edges)      # swap 폴백용 추가 차단과 병합
         route = self.router.shortest_path(
-            start, goal, blocked=blocked, blocked_edges=blocked_edges,
+            start, goal, blocked=blocked, blocked_edges=edges,
             penalized=self._others(robot_id))
         if not route:
             return False
@@ -147,6 +202,9 @@ class TrafficManager:
         i = st.reserved_end
         while i + 1 <= limit:
             nxt = st.route[i + 1]
+            if self._edge_blocked(st.route[i], nxt):
+                break                        # 장애물 차단 엣지 — 넘어가면 장애물로 감.
+                                             # 여기서 멈춰 next_edge_blocked로 재경로 유도
             owner = self.reservations.get(nxt)
             if owner is not None and owner != robot_id:
                 break                        # 남이 점유 → 여기까지, 다음 폴링에 재시도
@@ -210,6 +268,11 @@ class TrafficManager:
             i += 1
         if passed_i is None:
             return None
+        # 통과한 엣지가 차단돼 있었으면 자동 해제 — 물리적으로 지나감 = 치워졌다는 증거.
+        # (목적지 막힘 B안: 재시도하다 장애물 없어지면 통과 → 여기서 차단 정상화 → 시스템 자가치유)
+        for j in range(st.index, passed_i):
+            if self._edge_blocked(st.route[j], st.route[j + 1]):
+                self.unblock_edge(st.route[j], st.route[j + 1])
         self._advance(robot_id, passed_i)    # index 전진 + 지나온 노드 release
         return st.route[passed_i]
 
@@ -382,6 +445,7 @@ class TrafficManager:
         st = self.robots[robot_id]
         yielded_node = st.route[st.index]        # 내가 비켜주는 자리
         tail = self.router.shortest_path(esc[-1], self._goal(robot_id),
+                                         blocked_edges=set(self._blocked_edges),
                                          penalized=self._others(robot_id))
         if not tail:
             return False
