@@ -2,16 +2,24 @@
 
 RobotFSM에 믹스인으로 결합.
 담당 경계: 도킹(aruco_docking 서비스 호출부) = 도킹 팀원,
-          _fork(현재 스텁 → ESP32 micro-ROS 교체 예정) = 포크 담당 동료.
+          _fork(/fork_cmd·/fork_state ESP32 핸드셰이크) = 포크 담당 동료.
 """
 import time
 
+import rclpy
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
+from std_msgs.msg import Int32
 from std_srvs.srv import Trigger
 
 from robot_fsm import fork
 from robot_fsm.travel import _DIR_YAW, YAW_DOCK, YAW_FREE
+
+# 포크 핸드셰이크 상수 (/fork_state 값 — 0=미사용, IDLE 폐기)
+FORK_TIMEOUT = 90.0                              # AT_POSITION 대기 상한(초).
+# 최악 이동 2↔4=23400스텝. 28BYJ-48 @12RPM=409.6스텝/s → ~57s. 마진 포함 90s
+# (RPM을 10으로 낮춰도 ~69s라 커버). 모터 속도/스텝수 바뀌면 재계산.
+_FORK_MOVING, _FORK_AT, _FORK_ERROR = 1, 2, 3
 
 
 class WorkMixin:
@@ -31,15 +39,18 @@ class WorkMixin:
             return False
 
         for h in seq['before_dock']:
-            self._fork(h)
+            if not self._fork(h):
+                return False
         if not self._work_dock(loc.get('marker')):
             return False
         for h in seq['after_dock']:
-            self._fork(h)
+            if not self._fork(h):
+                return False
         if not self._undock():
             return False
         for h in seq['after_back']:
-            self._fork(h)
+            if not self._fork(h):
+                return False
         return True
 
     def _face_dock(self, node_name, direction):
@@ -62,14 +73,51 @@ class WorkMixin:
                                  double_value=float(tol)))]
         self._await_future(self._param_cli.call_async(req), timeout=3.0)
 
-    # ── 스텁: 포크 담당 동료 인터페이스 확정 시 교체 ────────────
+    # ── 포크 (ESP32 micro-ROS, /fork_cmd·/fork_state 핸드셰이크) ──
 
     def _fork(self, level):
-        """[스텁] micro-ROS 포크 명령 — 절대 높이 level(0~4)로."""
-        self.get_logger().info(
-            f'[{self.robot}] [스텁] 포크 → 높이 {level} (스텝 {fork.steps(level)})')
-        time.sleep(0.5)
-        return True
+        """포크 높이 level(1~4) 명령 → AT_POSITION까지 블로킹. 실패/타임아웃 시 False.
+
+        핸드셰이크(= Action 생명주기를 토픽으로): /fork_cmd 발행 → MOVING 목격
+        → AT_POSITION → True. ESP32는 명령마다 MOVING을 반드시 한 번 찍어(델타 0이어도)
+        이전 명령의 낡은 AT_POSITION과 구분되게 한다. FSM은 절대 높이만 보내고,
+        현재 스텝/델타 계산은 ESP32(cur_step)가 담당한다.
+
+        스레드: mission_loop에서 블록, _on_fork_state는 executor에서 갱신
+        (travel의 _transact/_on_response와 동일 패턴 — 락 불필요).
+        """
+        self._fork_moving_seen = False
+        self._fork_error = False
+        self._fork_last = None
+        self._fork_ev.clear()
+        self._fork_pub.publish(Int32(data=int(level)))
+        self.get_logger().info(f'[{self.robot}] 포크 → 높이 {level} 명령, 완료 대기')
+        deadline = time.time() + FORK_TIMEOUT
+        while rclpy.ok() and time.time() < deadline:
+            self._fork_ev.wait(timeout=0.5)
+            self._fork_ev.clear()
+            if self._fork_error:
+                self.get_logger().error(f'[{self.robot}] 포크 ERROR 보고 (높이 {level})')
+                return False
+            if self._fork_moving_seen and self._fork_last == _FORK_AT:
+                self.get_logger().info(f'[{self.robot}] 포크 높이 {level} 도달')
+                return True
+        self.get_logger().error(
+            f'[{self.robot}] 포크 타임아웃 {FORK_TIMEOUT}s (높이 {level}) — ESP32/Agent 확인')
+        return False
+
+    def _on_fork_state(self, msg):
+        """/fork_state 콜백 (executor 스레드) — 핸드셰이크 플래그 갱신.
+
+        1=MOVING(목격 기록) / 2=AT_POSITION / 3=ERROR. _fork가 ev로 대기 중.
+        """
+        v = int(msg.data)
+        self._fork_last = v
+        if v == _FORK_MOVING:
+            self._fork_moving_seen = True
+        elif v == _FORK_ERROR:
+            self._fork_error = True
+        self._fork_ev.set()
 
     # ── 도킹 (aruco_docking dock_controller) ──────────────────
 
