@@ -50,8 +50,9 @@ from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseWithCovarianceStamped, TwistStamped
 from rcl_interfaces.srv import SetParameters
-from std_msgs.msg import String
+from std_msgs.msg import String, Int32
 from std_srvs.srv import Trigger
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 
 from robot_fsm.states import S, TRANSITIONS, EXT_IDLE
@@ -108,6 +109,17 @@ class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
         self._undock_cli = self.create_client(Trigger, '/start_undock')
         self._estimator_param_cli = self.create_client(
             SetParameters, '/aruco_estimator/set_parameters')
+
+        # ── 포크 (ESP32 micro-ROS) — 절대 높이만 발행, cur_step 추적은 ESP32 ──
+        #   ★ /fork_state는 best_effort 필수: micro-ROS(rclc) 발행자를 reliable 구독자가
+        #     못 받는 Jazzy 인터롭 이슈(type_hash INVALID). best_effort면 수신됨. 실물 검증(HW).
+        #     상태는 5Hz 하트비트 + 이동 중 반복 발행이라 유실 몇 개는 핸드셰이크에 무해.
+        self._fork_pub = self.create_publisher(Int32, '/fork_cmd', 10)
+        _fork_state_qos = QoSProfile(depth=10)
+        _fork_state_qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        self.create_subscription(Int32, '/fork_state', self._on_fork_state, _fork_state_qos)
+        self._fork_last, self._fork_moving_seen, self._fork_error = None, False, False
+        self._fork_ev = threading.Event()
 
         # ── traffic ─────────────────────────────────────────
         self._req_pub = self.create_publisher(String, '/traffic/request', 10)
