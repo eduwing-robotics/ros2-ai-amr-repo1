@@ -80,7 +80,7 @@ class DockControllerNode(Node):
         #   v 안 올리고 캡처 확장. k_y_far_depth(원거리)~handoff_depth(근접) 선형보간.
         self.declare_parameter('k_y_far', 4.0)          # 원거리 k_y (실물 확정 — 강한 초기 선회, 무포화)
         self.declare_parameter('k_y_far_depth', 0.30)   # 이 거리 이상=k_y_far, handoff_depth서 k_y로 램프
-        self.declare_parameter('k_theta', 1.0)
+        self.declare_parameter('k_theta', 2.0)          # 헤딩교정 게인. skip case서 e_y≈0이면 ω≈k_θ·e_θ뿐 → 1.0은 약해 핸드오프 e_θ가 −1.7°까지 샘. 2.0=핸드오프 e_θ≈0 확보(실물검증 2026-07-14) → ALIGN 무동작 → 드리프트 소멸.
         self.declare_parameter('control_rate_hz', 20.0)
         self.declare_parameter('v_max', 0.02)
         self.declare_parameter('v_min', 0.008)
@@ -99,6 +99,9 @@ class DockControllerNode(Node):
         self.declare_parameter('prealign_omega', 0.3)       # 90° 회전 각속도
         self.declare_parameter('prealign_v', 0.03)          # 측면 직진 속도
         self.declare_parameter('prealign_ang_tol_deg', 1.5)  # 90° 회전 완료 허용오차
+        # ※ 재앵커(측정→재배치 반복)·측면 coast 보정은 실물검증(2026-07-14)으로 폐기:
+        #   재앵커 iter2는 오픈루프 바닥(~1cm)서 리밋사이클(1.4→−1.0cm, 축만 넘김)로 무익,
+        #   측면 coast는 3cm/s에 관성이 없어 언더슛만 유발. 1패스 후 잔차는 SERVO가 mm로 청소.
 
         # ── 핸드오프 (depth 주도 — 블러존 진입 전 SERVO 종료) ──────
         #   depth ≤ handoff_depth 되면 SERVO를 항상 종료. e_y ≤ handoff_max_ey 면 ALIGN→CREEP,
@@ -151,7 +154,7 @@ class DockControllerNode(Node):
 
         # ── 안전/타임아웃 ─────────────────────────────────────────
         self.declare_parameter('marker_timeout_sec', 0.7)
-        self.declare_parameter('dock_timeout_sec', 40.0)
+        self.declare_parameter('dock_timeout_sec', 40.0)     # PREALIGN 단일패스(~14s)+SERVO/ALIGN/CREEP(~18s) 수용.
 
         g = self.get_parameter
         self.base_frame = g('base_frame').value
@@ -388,9 +391,9 @@ class DockControllerNode(Node):
                 omega = _clamp(self.k_align * eth, -self.omega_max, self.omega_max)
                 self._publish(0.0, omega)
                 return
-            # 정면 확보 → 이미 축 위면 재배치 스킵, 아니면 e_y 캡처 후 TURN1.
+            # 정면 확보 → 이미 축 위(min_ey 이내)면 재배치 스킵하고 SERVO 직행, 아니면 e_y 캡처 후 측면 재배치.
             if abs(ey) < self.prealign_min_ey:
-                self.get_logger().info(f"PREALIGN 스킵 (e_y={ey:+.4f} 이미 축 위) → SERVO")
+                self.get_logger().info(f"PREALIGN 종료 (e_y={ey:+.4f}, 축 위) → SERVO")
                 self._enter_servo()
                 return
             eyt = _clamp(abs(ey), 0.0, self.prealign_max_ey)
@@ -424,6 +427,7 @@ class DockControllerNode(Node):
             if self._pa_pos0 is None:
                 return
             traveled = math.hypot(odom[0] - self._pa_pos0[0], odom[1] - self._pa_pos0[1])
+            # 목표 e_y만큼 측면직진. 잔차(회전·정지 오차)는 이어지는 SERVO가 폐루프로 청소.
             if traveled >= self._pa_ey_target:
                 with self._lock:
                     self._pa_yaw0 = odom[2]
@@ -444,8 +448,8 @@ class DockControllerNode(Node):
             turned = _norm(odom[2] - self._pa_yaw0)
             if turned * (-self._pa_dir) >= (math.pi / 2 - self.prealign_ang_tol):
                 self._stop()
-                self._enter_servo()
-                self.get_logger().info("PREALIGN TURN2(−90°) 완료 → SERVO (마커 재검출)")
+                self.get_logger().info("PREALIGN TURN2(−90°) 완료 → SERVO")
+                self._enter_servo()   # EMA 리셋 + 재획득 유예 처리
                 return
             self._publish(0.0, -self._pa_dir * self.prealign_omega)
             return
