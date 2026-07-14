@@ -132,13 +132,18 @@ class TrafficManager:
     # (index 점프 + escape_end 조기 해제 + 예약 오염 → 양쪽 동시 양보,
     #  유령 위치 때문에 상대가 실물 로봇 위로 라우팅). 2026-07-09 시뮬 실증.
     def reserve_forward(self, robot_id):
+        """예약 끝(reserved_end)에서 전방으로 빈 노드를 계속 확보. 반환: 새 reserved_end.
+
+        평시엔 경로 끝까지(전체 예약), 남의 예약을 만나면 거기서 멈춤 —
+        이후 next_segment 폴링마다 재호출되며 풀린 만큼 더 확보 (재시도 루프의 실체).
+        """
         st = self.robots[robot_id]
         if st.escape_end is not None:
-            limit = st.escape_end            # 대피 중: 대피 노드까지만
+            limit = st.escape_end            # 대피 중: 대피 노드까지만 (중복 꼬리 가짜통과 방지)
         elif self._hold_active(robot_id):
-            limit = st.index                 # 승자 통과 대기: 전진 예약 금지
+            limit = st.index                 # 승자 통과 대기: 전진 예약 동결
         else:
-            limit = len(st.route) - 1        # 평시: 전체 예약
+            limit = len(st.route) - 1        # 평시: 경로 끝까지 전체 예약
         i = st.reserved_end
         while i + 1 <= limit:
             nxt = st.route[i + 1]
@@ -147,7 +152,7 @@ class TrafficManager:
                 break                        # 남이 점유 → 여기까지, 다음 폴링에 재시도
             self.reservations[nxt] = robot_id
             i += 1
-        st.reserved_end = i
+        st.reserved_end = i                  # index ≤ reserved_end 불변식 유지
         return st.reserved_end
 
     # ── 다음 주행 구간 — 예약은 전체지만 주행 단위는 직선 run ─
@@ -187,20 +192,6 @@ class TrafficManager:
             if self.reservations.get(n) == robot_id:
                 del self.reservations[n]
 
-    def arrive(self, robot_id, node):
-        """node 도착 → index 갱신 + 지나온 뒤 노드 즉시 release.
-
-        대피 경로는 같은 노드가 두 번 나올 수 있어 현재 index 이후에서 탐색.
-        (로봇 0.25m < 노드간격 0.30m라 노드 중심에 서면 꼬리가 뒤 통로에
-         안 걸쳐 충돌 위험 낮음. 뒤 노드를 안 쥐므로 최종도착 시 통로 막힘도 없음.)
-        """
-        st = self.robots[robot_id]
-        try:
-            idx = st.route.index(node, st.index)
-        except ValueError:
-            return
-        self._advance(robot_id, idx)
-
     def update_position(self, robot_id, x, y):
         """로봇 amcl 위치 → 예약 전방 노드 반경 진입 시 통과 처리(release).
 
@@ -209,36 +200,37 @@ class TrafficManager:
         """
         st = self.robots.get(robot_id)
         if st is None:
-            return None
+            return None                      # 경로 없는 로봇의 pose는 무시
         passed_i = None
         i = st.index + 1
-        while i <= st.reserved_end and i < len(st.route):
+        while i <= st.reserved_end and i < len(st.route):   # 내 예약 창 안에서만 탐색
             nx, ny = self.graph.xy(st.route[i])
             if (x - nx) ** 2 + (y - ny) ** 2 <= self.ARRIVE_RADIUS ** 2:
-                passed_i = i
+                passed_i = i                 # 창 안에서 가장 멀리 도달한 노드로 갱신
             i += 1
         if passed_i is None:
             return None
-        self._advance(robot_id, passed_i)
+        self._advance(robot_id, passed_i)    # index 전진 + 지나온 노드 release
         return st.route[passed_i]
 
     # ── 조회 ─────────────────────────────────────────────
     def current_node(self, robot_id):
+        """현재(마지막 통과) 노드 = route[index]."""
         st = self.robots[robot_id]
         return st.route[st.index]
 
     def next_node(self, robot_id):
+        """다음 진행 예정 노드. 목적지에 서 있으면 None."""
         st = self.robots[robot_id]
         return st.route[st.index + 1] if st.index + 1 < len(st.route) else None
 
     def is_done(self, robot_id):
+        """목적지 도착 여부 (index가 경로 끝)."""
         st = self.robots[robot_id]
         return st.index >= len(st.route) - 1
 
-    def reserved_nodes(self, robot_id):
-        return [n for n, v in self.reservations.items() if v == robot_id]
-
     def _goal(self, robot_id):
+        """이 로봇의 최종 목적지 노드 (대피 재경로에서도 불변)."""
         return self.robots[robot_id].route[-1]
 
     # ── 교착 감지 · 중재 (주기적 호출) ────────────────────
@@ -319,6 +311,7 @@ class TrafficManager:
         return actions
 
     def _is_head_on(self, a, b):
+        """정면 대치 판정 — 서로의 다음 노드가 상대의 현재 노드 (맞물림)."""
         na, nb = self.next_node(a), self.next_node(b)
         ca, cb = self.current_node(a), self.current_node(b)
         return na == cb and nb == ca
@@ -333,15 +326,15 @@ class TrafficManager:
         """
         st = self.robots[robot_id]
         opp = self.robots[opponent]
-        opp_path = set(opp.route[opp.index:])
+        opp_path = set(opp.route[opp.index:])    # 이 집합 "밖"이 대피 성공 조건
         start = st.route[st.index]
         q = deque([[start]])
         seen = {start}
         while q:
-            path = q.popleft()
+            path = q.popleft()                   # BFS → 처음 찾은 곳 = 최소 칸수 대피처
             node = path[-1]
             if node != start and node not in opp_path:
-                return path
+                return path                      # 상대 경로 밖 도달 — 여기 서 있으면 안전
             for nb, _ in self.graph.neighbors(node):
                 if nb in seen:
                     continue
@@ -350,7 +343,7 @@ class TrafficManager:
                     continue             # 남의 점유 노드는 통과 불가
                 seen.add(nb)
                 q.append(path + [nb])
-        return None
+        return None                              # 갈 곳 없음 → _pick_yielder가 폴백 판단
 
     def _pick_yielder(self, a, b):
         """양보(대피)할 로봇 결정 — 대칭 대피 비용 비교.
@@ -403,6 +396,10 @@ class TrafficManager:
 
     # ── 폴백: 구식 우회 (대피 불가 시) ────────────────────
     def _reroute(self, robot_id, opponent):
+        """상대의 현재·다음 노드를 피해 전체 경로 재계산 (대피가 불가능할 때만).
+
+        일반 케이스 = 노드 회피(blocked), swap 케이스 = 직행 엣지만 차단.
+        """
         st = self.robots[robot_id]
         cur = self.current_node(robot_id)
         goal = self._goal(robot_id)
