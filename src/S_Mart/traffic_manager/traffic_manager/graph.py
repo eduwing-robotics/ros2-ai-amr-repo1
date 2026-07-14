@@ -28,7 +28,7 @@ _BLOCKED_EDGES = {
     frozenset(('N20', 'N25')),  # home_B - home_A 사이 통과 금지
 }
 
-
+# 생성자에서 모든 계산이 끝남. 이후 읽기만 하는 객체. (런타임에 그래프 변경 X)
 class Graph:
     """노드 좌표 + 인접(엣지) 그래프.
 
@@ -36,6 +36,7 @@ class Graph:
     adj:   {name: [(이웃, 비용), ...]}   (blocked 제외)
     """
 
+    # 노드 로드
     def __init__(self, nodes_file=None):
         if nodes_file is None:
             nodes_file = os.path.join(
@@ -43,9 +44,10 @@ class Graph:
             )
         with open(nodes_file) as f:
             self.nodes = yaml.safe_load(f)['nodes']
-        self.free = [n for n in self.nodes if not self.nodes[n].get('blocked')]
+        self.free = [n for n in self.nodes if not self.nodes[n].get('blocked')]    # 장애물 노드 지움 (blocked 노드 제외)
         self.adj = self._build_adjacency()
 
+    # 엣지 생성
     def _build_adjacency(self):
         adj = {n: [] for n in self.free}
         for a in self.free:
@@ -64,22 +66,26 @@ class Graph:
                     adj[a].append((b, self._edge_cost(a, b)))
         return adj
 
+    # 엣지 비용 연산
     def _edge_cost(self, a, b):
         cost = _STEP
         if frozenset((a, b)) in _PENALTY_EDGES:
             cost *= _PENALTY_FACTOR
         return round(cost, 3)
 
-    # --- 조회 헬퍼 ---
+    # Router(다익스트라) 사용
     def neighbors(self, node):
         return self.adj.get(node, [])
 
+    # Traffic (통과 판정 및 방향계산) 사용
     def xy(self, node):
         nd = self.nodes[node]
         return nd['x'], nd['y']
 
+    # Router (출발 도착시 사용)
     def is_blocked(self, node):
         return self.nodes.get(node, {}).get('blocked', False)
 
+    # Router 사용
     def exists(self, node):
         return node in self.nodes
