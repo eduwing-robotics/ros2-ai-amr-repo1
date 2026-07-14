@@ -32,5 +32,8 @@ def generate_launch_description():
             output='screen',
             # 확정 게인은 노드 기본값. auto_undock_delay=0(FSM이 undock 분리 호출).
             parameters=[{'auto_undock_delay': 0.0}],
+            # odom = raw 휠(IMU 없음, 바닥 슬립 시 yaw 틀어짐) → EKF 융합 출력으로.
+            #   PREALIGN·CREEP·UNDOCK의 회전(yaw) 정밀도 개선. (EKF는 smart_robot_bringup에서 발행)
+            remappings=[('odom', '/odometry/filtered')],
         ),
     ])
