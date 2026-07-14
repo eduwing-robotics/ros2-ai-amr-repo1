@@ -60,7 +60,7 @@ bt_navigator:
     robot_base_frame: base_link
     transform_tolerance: 0.5
     filter_duration: 0.3
-    default_nav_to_pose_bt_xml: "$(find-pkg-share nav2_bt_navigator)/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml" # behavior trees location.
+    default_nav_to_pose_bt_xml: "$(find-pkg-share smart_nav_bringup)/behavior_trees/smart_navigate.xml" # 커스텀 트리: plan-once + wait-only recovery (사람정지 확장 예정)
     default_nav_through_poses_bt_xml: "$(find-pkg-share nav2_bt_navigator)/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
     always_reload_bt_xml: false
     goal_blackboard_id: goal
@@ -178,7 +178,7 @@ controller_server:
       allow_reversing: false
       max_robot_pose_search_dist: 1.0
       use_collision_detection: true
-      max_allowed_time_to_collision_up_to_carrot: 1.0
+      max_allowed_time_to_collision_up_to_carrot: 1.5   # 1.0→2.0(오정지)→1.5 절충: 여유 있게 정지하되 협소부 벽 오정지 완화
       min_approach_linear_velocity: 0.05    # 0.02 → 0.05 (도착 직전 덜 기어감)
       approach_velocity_scaling_dist: 0.12  # 0.3 → 0.12 (목적지 가까이서만 감속, 마지막 엣지 내내 느려지지 않게)
     enable_stamped_cmd_vel: true

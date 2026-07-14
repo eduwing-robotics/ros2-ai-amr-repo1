@@ -1,0 +1,28 @@
+<!--
+  smart_navigate — S-Mart 커스텀 navigate_to_pose 트리 (최종 트리, 확장 예정)
+  현재: plan-once + wait-only recovery. 향후: 사람 발견 정지(BT 게이트) 추가 예정.
+  기본 navigate_to_pose_w_replanning_and_recovery.xml 에서:
+   - plan-once: PipelineSequence(매 tick 전체 재실행) → Sequence(memory)로 교체.
+     ComputePathToPose는 처음 1회 성공 후 재실행 안 됨 → 이후 FollowPath만.
+     FollowPath 실패 → Wait 복구 → RecoveryNode 재진입 시 Sequence 리셋 → 그때 계획 1회 재실행.
+     (RateController 1Hz 재계획 불필요 — 세그먼트=짧은 직선, 진짜 계획은 traffic. Pi CPU 절약)
+   - contextual ClearEntireCostmap 제거 (Compute/FollowPath 실패 시 costmap 클리어)
+     → 진짜 장애물을 통째로 지우면 재구축이 못 따라와 "Costmap timed out" cascade 유발 (2026-07-14 실기 확인)
+   - recovery RoundRobin의 ClearingActions / Spin / BackUp 제거 → Wait 만
+     → 좁은 통로(≈로봇)에서 spin/backup 위험. 장애물은 위상적으로 우회(traffic)
+   - ReactiveFallback+GoalUpdated 제거 → 복구 중 goal 교체 시나리오 없음
+     (robot_fsm이 세그먼트마다 NavigateToPose를 새로 보냄). 복구 = Wait 하나로 단순화.
+  일시적 장애물(사람) 재개는 obstacle_layer raytrace clearing(clearing:true)이 상시 처리 → Wait 사이 재시도로 통과.
+  지속 장애물은 계속 막힘 → Wait 반복 → number_of_recoveries 누적 → (예정) FSM이 감지 후 traffic 재경로.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <Sequence name="NavigatePlanOnce">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}"/>
+        <FollowPath path="{path}" controller_id="FollowPath" error_code_id="{follow_path_error_code}"/>
+      </Sequence>
+      <Wait wait_duration="5.0"/>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
