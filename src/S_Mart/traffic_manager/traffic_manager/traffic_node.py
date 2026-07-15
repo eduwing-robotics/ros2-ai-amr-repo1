@@ -41,7 +41,7 @@ class TrafficNode(Node):
         self.create_subscription(String, '/traffic/request', self._on_request, 10)
         self.create_subscription(String, '/traffic/pose', self._on_pose, 10)
         # 장애물 차단 해제 — 테스트/정비용 수동 훅 (나중에 관제 GUI가 이 토픽 발행).
-        #   {"a":"N14","b":"N19"} 특정 엣지 해제 / {"all":true} 전체 해제
+        #   {"node":"N9"} 특정 노드 해제 / {"all":true} 전체 해제
         self.create_subscription(String, '/traffic/unblock', self._on_unblock, 10)
         self.create_timer(0.5, self._on_timer)
         self.get_logger().info('Traffic Manager 노드 시작 (토픽 인터페이스)')
@@ -54,9 +54,9 @@ class TrafficNode(Node):
         if d.get('all'):
             self.tm.clear_blocks()
             self.get_logger().info('장애물 차단 전체 해제')
-        elif 'a' in d and 'b' in d:
-            self.tm.unblock_edge(d['a'], d['b'])
-            self.get_logger().info(f'장애물 차단 해제: {d["a"]}↔{d["b"]}')
+        elif 'node' in d:
+            self.tm.unblock_node(d['node'])
+            self.get_logger().info(f'장애물 차단 해제: {d["node"]}')
 
     def _on_pose(self, msg):
         """로봇 위치 → traffic이 통과 노드 감지 → 앞으로 지난 노드 release."""
@@ -105,20 +105,19 @@ class TrafficNode(Node):
             self._reply_segment(robot)
 
         elif rtype == 'blocked':
-            # 로봇이 recovery로 지속 장애물 확정 → 엣지 전역 차단 + 대응 결정
-            kind, edge, route = self.tm.report_obstacle(robot)
-            if edge is not None:
-                a, b = tuple(edge)
+            # 로봇이 recovery로 지속 장애물 확정 → 노드 전역 차단 + 대응 결정
+            kind, node, route = self.tm.report_obstacle(robot)
+            if node is not None:
                 if kind == 'goal_blocked':
                     self.get_logger().warn(
-                        f'⚠️ {robot} 목적지 노드 막힘 ({b}) — 대기. '
-                        f'사람이 치우고 /traffic/unblock 필요')
-                    # TODO(GUI): pg_notify('obstacle_detected', {kind:goal_blocked, node:b}) — 긴급(로봇 정지)
+                        f'⚠️ {robot} 목적지 노드 막힘 ({node}) — 대기. '
+                        f'사람이 치우고 통과하면 자동해제(or /traffic/unblock)')
+                    # TODO(GUI): pg_notify('obstacle_detected', {kind:goal_blocked, node}) — 긴급(로봇 정지)
                 else:
                     self.get_logger().warn(
-                        f'⚠️ {robot} 장애물 엣지 차단 {a}↔{b} ({kind}). '
-                        f'사람이 치우고 /traffic/unblock')
-                    # TODO(GUI): pg_notify('obstacle_detected', {kind:edge, edge}) — 우회 중
+                        f'⚠️ {robot} 장애물 노드 차단 {node} ({kind}). '
+                        f'사람이 치우면 통과 시 자동해제(or /traffic/unblock)')
+                    # TODO(GUI): pg_notify('obstacle_detected', {kind, node}) — 우회 중
             if kind == 'reroute':
                 self._send(robot, {'type': 'reroute', 'route': route})
                 self.get_logger().info(f'{robot} 우회: {"→".join(route)}')
@@ -134,8 +133,8 @@ class TrafficNode(Node):
             self._send(robot, {'type': 'segment', 'nodes': seg})
         elif self.tm.is_done(robot):
             self._send(robot, {'type': 'done'})
-        elif self.tm.next_edge_blocked(robot):
-            # 진행 방향 엣지가 (다른 로봇이 감지한) 장애물 차단
+        elif self.tm.next_node_blocked(robot):
+            # 진행 방향 노드가 (다른 로봇이 감지한) 장애물 차단
             st = self.tm.robots[robot]
             nxt = st.route[st.index + 1]
             if nxt == st.route[-1]:
@@ -143,7 +142,7 @@ class TrafficNode(Node):
                 self._send(robot, {'type': 'wait'})
             elif self.tm.set_route(robot, self.tm.current_node(robot),
                                    st.route[-1], laden=st.laden):
-                # 로봇B: 경유 엣지 차단 → 분기점에서 미리 우회
+                # 로봇B: 경유 노드 차단 → 분기점에서 미리 우회
                 self._send(robot, {'type': 'reroute',
                                    'route': self.tm.robots[robot].route})
                 self.get_logger().info(
