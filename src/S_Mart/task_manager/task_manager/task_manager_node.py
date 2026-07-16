@@ -2,27 +2,43 @@
 """Task Manager ROS2 노드 — 임무 생성 전담 (할당은 Fleet Manager가 담당)
 
 트리거 4종:
-  1. PostgreSQL LISTEN new_order    → outbound task 생성          (서브 스레드)
-  2. /detection/inbound  구독       → inbound task 생성           (메인 스레드 콜백)
-  3. /detection/pickup   구독       → outbound task done, delivered (메인 스레드 콜백)
-  4. /detection/no_pickup 구독      → outbound task cancelled + reclaim task 생성 (메인 스레드 콜백)
+  1. PostgreSQL LISTEN new_order            → outbound task 생성      (서브 스레드)
+  2. PostgreSQL LISTEN order_status_updated → awaiting_pickup 감지 시 미수령 타이머 시작
+                                              (서브 스레드)
+  3. /detection/inbound 구독  → inbound task 생성                    (메인 스레드 콜백)
+  4. /detection/cleared 구독  → 게이트가 비면 outbound done, delivered (메인 스레드 콜백)
+  + 1Hz 자체 검사             → 타이머 만료 시 outbound cancelled + reclaim 생성
 
 생성된 task는 /new_task 토픽으로 Fleet Manager에 신호를 보냄.
 
+★ 미수령 타이머를 여기서 소유하는 이유 (2026-07-16 실주행 사고):
+  예전엔 감지 노드가 타이머를 들고 no_pickup을 발행했다. 그런데 감지 노드는
+  '물건이 보이는 순간' 타이머를 시작하는 반면 여기는 주문이 awaiting_pickup이
+  된 뒤에만 신호를 받는다. 로봇이 물건을 내려놓고 완료 보고까지 49초가 걸려
+  30초 타이머가 먼저 터졌고, no_pickup은 "awaiting_pickup 주문 없음"으로 버려졌다.
+  감지 노드는 그 뒤 COOLDOWN에 갇혀 다시는 신호를 못 보냈고, 주문은
+  awaiting_pickup에 영구 고착 → 게이트·선반이 같이 죽었다.
+  시계와 주문 상태가 다른 프로세스에 있으면 반드시 어긋난다. 이제 둘 다 여기 있다.
+
+  ※ 마감 시각은 메모리(_deadlines)에 둔다. 이 노드가 재시작하면 진행 중이던
+    awaiting_pickup 주문의 마감이 사라져 만료 판정이 영영 안 된다(= 위 고착 재발).
+    그때 물리면 orders.awaiting_pickup_at 컬럼을 추가해 DB에서 계산할 것.
+
 연결 구조 (스레드 간 psycopg2 커넥션 공유 불가 → 스레드별 전용 커넥션):
   - _listen_conn (AUTOCOMMIT): 서브 스레드 전용, LISTEN+poll만 사용
-  - _sub_db     (기본):        서브 스레드 전용, outbound task INSERT 트랜잭션
+  - _sub_db     (기본):        서브 스레드 전용, outbound task INSERT·게이트 조회 트랜잭션
   - _main_db    (기본):        메인 스레드 전용, 나머지 모든 DB 작업
 
 reserved_by 해제 시점:
-  - /detection/pickup 수신 시 → 고객이 실제로 상품을 가져간 것이 확인된 시점에만 해제
-  - no_pickup 시 → outbound task_id에서 reclaim task_id로 교체 (슬롯 잠금 유지)
-  - 이렇게 해야 no_pickup 시 원래 슬롯이 다른 임무에 뺏기지 않음
+  - /detection/cleared 수신 시 → 고객이 실제로 상품을 가져간 것이 확인된 시점에만 해제
+  - 미수령 시 → outbound task_id에서 reclaim task_id로 교체 (슬롯 잠금 유지)
+  - 이렇게 해야 미수령 시 원래 슬롯이 다른 임무에 뺏기지 않음
 """
 
 import json
 import select
 import threading
+import time
 from datetime import datetime, timezone
 
 import psycopg2
@@ -50,6 +66,16 @@ class TaskManagerNode(Node):
         # 메인 스레드: inbound/pickup/no_pickup 처리용
         self._main_db = psycopg2.connect(_DSN)
 
+        # 미수령 시한 — 냉동은 녹으므로 더 짧게. awaiting_pickup 시점부터 센다.
+        self.declare_parameter('chilled_timeout', 30.0)
+        self.declare_parameter('frozen_timeout', 15.0)
+
+        # 미수령 마감 — {게이트: (order_id, time.monotonic() 기준 마감)}.
+        # 서브 스레드(LISTEN)가 쓰고 메인 스레드(1Hz 검사)가 읽고 지우므로 락 필요.
+        # 벽시계 대신 monotonic — NTP 보정에 흔들리지 않게.
+        self._deadlines = {}
+        self._deadlines_lock = threading.Lock()
+
         # Fleet Manager로 새 task 알림
         self._pub = self.create_publisher(String, '/new_task', 10)
 
@@ -57,11 +83,12 @@ class TaskManagerNode(Node):
         # {"product_name": "사과"} — 슬롯은 Task Manager가 선택
         self.create_subscription(String, '/detection/inbound', self._on_inbound, 10)
 
-        # 수령 감지 — 1분 이내 게이트에서 물건이 사라짐 (고객 수령), 페이로드 없음
-        self.create_subscription(String, '/detection/pickup', self._on_pickup, 10)
+        # 게이트 비움 감지 — {"slot":"OUT-1"}. 고객 수령인지 reclaim 회수인지는
+        # 감지 노드가 모른다. 주문 상태로 여기서 판단한다 (awaiting_pickup일 때만 수령).
+        self.create_subscription(String, '/detection/cleared', self._on_cleared, 10)
 
-        # 미수령 감지 — 1분 지나도 게이트에 물건이 그대로, 페이로드 없음
-        self.create_subscription(String, '/detection/no_pickup', self._on_no_pickup, 10)
+        # 미수령 마감 검사 — 1Hz면 충분 (시한이 15s/30s 단위)
+        self.create_timer(1.0, self._check_expired)
 
         # LISTEN 서브 스레드 시작 (daemon=True: 메인 스레드 종료 시 자동 종료)
         threading.Thread(target=self._listen_orders, daemon=True).start()
@@ -71,14 +98,19 @@ class TaskManagerNode(Node):
     # ── 서브 스레드: LISTEN new_order ─────────────────────────────────────────
 
     def _listen_orders(self):
-        """PostgreSQL NOTIFY new_order 대기 → outbound task 생성.
+        """PostgreSQL NOTIFY 대기 → 채널별 처리.
+
+          new_order            → outbound task 생성
+          order_status_updated → awaiting_pickup이면 미수령 타이머 시작
+                                 (fleet_manager가 로봇 완료 보고 시 발행)
 
         rclpy.spin()이 메인 스레드를 점유하기 때문에 서브 스레드에서 실행.
         NOTIFY가 올 때까지 select()로 블로킹 대기하며 메인 스레드와 간섭 없음.
         """
         cur = self._listen_conn.cursor()
         cur.execute('LISTEN new_order')
-        self.get_logger().info('LISTEN new_order 등록 완료')
+        cur.execute('LISTEN order_status_updated')
+        self.get_logger().info('LISTEN new_order, order_status_updated 등록 완료')
 
         while rclpy.ok():
             # 5초마다 종료 신호 체크 (rclpy.ok()가 False가 되면 루프 탈출)
@@ -87,10 +119,66 @@ class TaskManagerNode(Node):
                 for notify in self._listen_conn.notifies:
                     try:
                         payload = json.loads(notify.payload)
-                        self._create_outbound_task(payload['order_id'])
+                        if notify.channel == 'new_order':
+                            self._create_outbound_task(payload['order_id'])
+                        elif payload.get('status') == 'awaiting_pickup':
+                            self._arm_pickup_timer(payload['order_id'])
                     except Exception as e:
-                        self.get_logger().error(f'outbound task 생성 실패: {e}')
+                        self.get_logger().error(
+                            f'NOTIFY 처리 실패 ({notify.channel}): {e}')
                 self._listen_conn.notifies.clear()
+
+    def _arm_pickup_timer(self, order_id):
+        """awaiting_pickup 진입 → 그 게이트의 미수령 마감 등록 (서브 스레드).
+
+        시한은 상품의 storage_type(DB)으로 고른다 — 감지 노드가 분류를 실어보낼
+        필요가 없다. 게이트도 감지 신호가 아니라 DB의 outbound task에서 읽는다.
+        """
+        cur = self._sub_db.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT t.target_location_id, p.storage_type
+                FROM tasks t
+                JOIN orders o ON o.id = t.order_id
+                JOIN products p ON p.name = o.product_name
+                WHERE t.order_id = %s AND t.type = 'outbound'
+                ORDER BY t.created_at DESC LIMIT 1
+                """,
+                (order_id,)
+            )
+            row = cur.fetchone()
+            self._sub_db.commit()
+            if not row:
+                self.get_logger().warn(
+                    f'order_id={order_id}의 outbound task 없음 — 미수령 타이머 미등록')
+                return
+            gate, storage = row
+            timeout = (self.get_parameter('frozen_timeout').value
+                       if storage == 'frozen'
+                       else self.get_parameter('chilled_timeout').value)
+            with self._deadlines_lock:
+                self._deadlines[gate] = (order_id, time.monotonic() + timeout)
+            self.get_logger().info(
+                f'수령 대기 시작: order_id={order_id}, gate={gate}, '
+                f'{storage} → {timeout:.0f}s 후 미수령 판정')
+        except Exception as e:
+            self._sub_db.rollback()
+            self.get_logger().error(f'미수령 타이머 등록 실패 (order_id={order_id}): {e}')
+
+    # ── 메인 스레드: 1Hz 미수령 검사 ──────────────────────────────────────────
+
+    def _check_expired(self):
+        """마감 지난 게이트 → 미수령 처리. 마감은 먼저 지워 중복 처리 방지."""
+        now = time.monotonic()
+        with self._deadlines_lock:
+            expired = [(gate, oid) for gate, (oid, due) in self._deadlines.items()
+                       if now >= due]
+            for gate, _ in expired:
+                del self._deadlines[gate]
+        for gate, order_id in expired:
+            self.get_logger().warn(f'미수령 시한 경과: order_id={order_id}, gate={gate}')
+            self._cancel_and_reclaim(gate)
 
     # ── 메인 스레드: ROS2 콜백 ────────────────────────────────────────────────
 
@@ -107,42 +195,57 @@ class TaskManagerNode(Node):
             return
         self._create_inbound_task(data['product_name'])
 
-    def _on_pickup(self, msg: String):
-        """수령 감지 콜백 — 1분 이내 게이트에서 물건이 사라짐.
+    def _on_cleared(self, msg: String):
+        """게이트 비움 콜백 — {"slot":"OUT-1"}.
 
-        AI Server가 페이로드 없이 발행. awaiting_pickup 주문을 DB에서 직접 조회.
-        outbound task = done, order = delivered, reserved_by = NULL (슬롯 완전 해방).
+        그 게이트에 awaiting_pickup 주문이 있으면 = 고객이 가져간 것 → delivered.
+        없으면 = 미수령 후 reclaim 로봇이 집어간 것(주문은 이미 cancelled)이거나
+        오감지 → _mark_done_and_delivered가 경고 후 무시한다. DB 상태가 방어막이라
+        감지 노드 쪽에 COOLDOWN 같은 장치가 필요 없다.
         """
-        self._mark_done_and_delivered()
+        slot = self._parse_slot(msg)
+        if not slot:
+            self.get_logger().warn('slot 없는 cleared 신호 — 무시 (대상 게이트 특정 불가)')
+            return
+        # 수령됐으니 미수령 마감 취소. 마감이 없어도(이미 만료·다른 게이트) 무해.
+        with self._deadlines_lock:
+            self._deadlines.pop(slot, None)
+        self._mark_done_and_delivered(slot)
 
-    def _on_no_pickup(self, msg: String):
-        """미수령 감지 콜백 — 1분 지나도 게이트에 물건이 그대로.
-
-        AI Server가 페이로드 없이 발행. awaiting_pickup 주문을 DB에서 직접 조회.
-        outbound task = cancelled, order = cancelled(no_pickup).
-        reclaim task 생성 후 reserved_by를 reclaim_task_id로 교체 (슬롯 잠금 유지).
-        """
-        self._cancel_and_reclaim()
+    @staticmethod
+    def _parse_slot(msg: String):
+        """감지 페이로드에서 출고 게이트(slot) 추출. 없거나 파싱 실패 시 None."""
+        try:
+            return json.loads(msg.data).get('slot')
+        except (ValueError, AttributeError):
+            return None
 
     # ── 상태 업데이트 ─────────────────────────────────────────────────────────
 
-    def _mark_done_and_delivered(self):
+    def _mark_done_and_delivered(self, slot):
         """수령 확인 → outbound task done + order delivered + 슬롯 해방.
 
-        OUT-1이 하나이므로 awaiting_pickup 주문은 항상 유일.
-        오감지 시 awaiting_pickup 주문 없음 → 경고 후 종료.
+        slot(OUT-1/OUT-2)의 awaiting_pickup 주문만 처리 (2공간 구분).
+        해당 주문 없으면 = reclaim 회수 or 오감지 → 경고 후 종료.
         """
         cur = self._main_db.cursor()
         try:
             now = datetime.now(timezone.utc)
 
-            # awaiting_pickup 주문 조회 (OUT-1 하나 → 항상 유일)
+            # 해당 게이트의 awaiting_pickup 주문 조회
             cur.execute(
-                "SELECT id FROM orders WHERE status = 'awaiting_pickup' LIMIT 1"
+                """
+                SELECT o.id FROM orders o
+                JOIN tasks t ON t.order_id = o.id AND t.type = 'outbound'
+                WHERE o.status = 'awaiting_pickup' AND t.target_location_id = %s
+                ORDER BY t.created_at DESC LIMIT 1
+                """,
+                (slot,)
             )
             order_row = cur.fetchone()
             if not order_row:
-                self.get_logger().warn('awaiting_pickup 주문 없음 — 오감지 또는 이미 처리됨')
+                self.get_logger().warn(
+                    f'awaiting_pickup 주문 없음 (slot={slot}) — 오감지 또는 이미 처리됨')
                 self._main_db.rollback()
                 return
             order_id = order_row[0]
@@ -161,7 +264,7 @@ class TaskManagerNode(Node):
                 self.get_logger().error(f'order_id={order_id}의 outbound task 없음')
                 self._main_db.rollback()
                 return
-            task_id, slot = row
+            task_id, shelf = row       # shelf=원래 선반(source). slot은 게이트(target)
 
             # outbound task = done
             cur.execute(
@@ -180,15 +283,15 @@ class TaskManagerNode(Node):
                 ('order_status_updated', json.dumps({'order_id': order_id, 'status': 'delivered'}))
             )
 
-            # 슬롯 완전 해방 — 고객이 상품을 가져간 것이 확인된 시점에만 해제
+            # 선반 완전 해방 — 고객이 상품을 가져간 것이 확인된 시점에만 해제
             cur.execute(
                 "UPDATE locations SET reserved_by = NULL, product_name = NULL, inbound_at = NULL WHERE location_id = %s",
-                (slot,)
+                (shelf,)
             )
             # FastAPI WebSocket broadcast 트리거 (고객 UI 재고 실시간 갱신)
             cur.execute(
                 'SELECT pg_notify(%s, %s)',
-                ('location_updated', json.dumps({'location_id': slot}))
+                ('location_updated', json.dumps({'location_id': shelf}))
             )
 
             cur.execute(
@@ -198,38 +301,46 @@ class TaskManagerNode(Node):
 
             self._main_db.commit()
             self.get_logger().info(
-                f'수령 완료: order_id={order_id}, task_id={task_id}, slot={slot} 해방'
+                f'수령 완료: order_id={order_id}, task_id={task_id}, '
+                f'gate={slot}, shelf={shelf} 해방'
             )
 
         except Exception as e:
             self._main_db.rollback()
             self.get_logger().error(f'수령 처리 실패: {e}')
 
-    def _cancel_and_reclaim(self):
+    def _cancel_and_reclaim(self, slot):
         """미수령 → outbound task cancelled + reclaim task 생성 + 슬롯 잠금 유지.
 
-        OUT-1이 하나이므로 awaiting_pickup 주문은 항상 유일.
-        오감지 시 awaiting_pickup 주문 없음 → 경고 후 종료.
+        slot(OUT-1/OUT-2)의 awaiting_pickup 주문만 처리 (2공간 구분).
+        해당 주문 없으면 = 이미 수령됐거나 처리됨 → 경고 후 종료.
         """
         cur = self._main_db.cursor()
         try:
             now = datetime.now(timezone.utc)
 
-            # awaiting_pickup 주문 조회 (OUT-1 하나 → 항상 유일)
+            # 해당 게이트의 awaiting_pickup 주문 조회
             cur.execute(
-                "SELECT id FROM orders WHERE status = 'awaiting_pickup' LIMIT 1"
+                """
+                SELECT o.id FROM orders o
+                JOIN tasks t ON t.order_id = o.id AND t.type = 'outbound'
+                WHERE o.status = 'awaiting_pickup' AND t.target_location_id = %s
+                ORDER BY t.created_at DESC LIMIT 1
+                """,
+                (slot,)
             )
             order_row = cur.fetchone()
             if not order_row:
-                self.get_logger().warn('awaiting_pickup 주문 없음 — 오감지 또는 이미 처리됨')
+                self.get_logger().warn(
+                    f'awaiting_pickup 주문 없음 (slot={slot}) — 오감지 또는 이미 처리됨')
                 self._main_db.rollback()
                 return
             order_id = order_row[0]
 
-            # outbound task 조회
+            # outbound task 조회 (target_location_id = 물건이 놓인 출고 게이트)
             cur.execute(
                 """
-                SELECT id, source_location_id, product_name FROM tasks
+                SELECT id, source_location_id, product_name, target_location_id FROM tasks
                 WHERE order_id = %s AND type = 'outbound'
                 ORDER BY created_at DESC LIMIT 1
                 """,
@@ -240,7 +351,7 @@ class TaskManagerNode(Node):
                 self.get_logger().error(f'order_id={order_id}의 outbound task 없음')
                 self._main_db.rollback()
                 return
-            outbound_task_id, original_slot, product_name = row
+            outbound_task_id, original_slot, product_name, out_gate = row
 
             # outbound task = cancelled (임무 실패 — 고객 미수령)
             cur.execute(
@@ -266,7 +377,7 @@ class TaskManagerNode(Node):
                 }))
             )
 
-            # reclaim task 생성 (source: OUT-1 게이트, target: 원래 슬롯)
+            # reclaim task 생성 (source: 물건이 놓인 출고 게이트, target: 원래 슬롯)
             cur.execute(
                 """
                 INSERT INTO tasks
@@ -275,7 +386,7 @@ class TaskManagerNode(Node):
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                ('reclaim', 'pending', product_name, order_id, 'OUT-1', original_slot, now)
+                ('reclaim', 'pending', product_name, order_id, out_gate, original_slot, now)
             )
             reclaim_task_id = cur.fetchone()[0]
 
@@ -348,9 +459,35 @@ class TaskManagerNode(Node):
                 return
             source_loc = slot[0]
 
+            # 빈 출고 게이트 선택 (OUT-1/OUT-2 중 현재 점유 안 된 것).
+            # 점유 = 진행 중 outbound가 target하거나, 진행 중 reclaim이 source로 쓰는 게이트.
+            cur.execute(
+                """
+                SELECT g FROM (VALUES ('OUT-1'), ('OUT-2')) AS gates(g)
+                WHERE g NOT IN (
+                    SELECT t.target_location_id FROM tasks t
+                    JOIN orders o ON o.id = t.order_id
+                    WHERE t.type = 'outbound'
+                      AND o.status IN ('processing', 'awaiting_pickup')
+                    UNION
+                    SELECT t.source_location_id FROM tasks t
+                    WHERE t.type = 'reclaim' AND t.status IN ('pending', 'assigned')
+                )
+                ORDER BY g ASC
+                LIMIT 1
+                """
+            )
+            gate_row = cur.fetchone()
+            if not gate_row:
+                self.get_logger().warn(
+                    '빈 출고 게이트 없음 (OUT-1·OUT-2 모두 점유) — outbound task 보류')
+                self._sub_db.rollback()
+                return
+            out_gate = gate_row[0]
+
             now = datetime.now(timezone.utc)
 
-            # outbound task INSERT (source: 슬롯, target: 출고 게이트)
+            # outbound task INSERT (source: 슬롯, target: 선택된 출고 게이트)
             cur.execute(
                 """
                 INSERT INTO tasks
@@ -359,7 +496,7 @@ class TaskManagerNode(Node):
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                ('outbound', 'pending', product_name, order_id, source_loc, 'OUT-1', now)
+                ('outbound', 'pending', product_name, order_id, source_loc, out_gate, now)
             )
             task_id = cur.fetchone()[0]
 
@@ -388,7 +525,8 @@ class TaskManagerNode(Node):
             self._sub_db.commit()
 
             self.get_logger().info(
-                f'outbound task 생성: task_id={task_id}, order_id={order_id}, slot={source_loc}'
+                f'outbound task 생성: task_id={task_id}, order_id={order_id}, '
+                f'slot={source_loc} → gate={out_gate}'
             )
             self._pub.publish(
                 String(data=json.dumps({'task_id': task_id, 'task_type': 'outbound'}))
