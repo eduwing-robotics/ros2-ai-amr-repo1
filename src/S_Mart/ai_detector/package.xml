@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ai_detector</name>
+  <version>0.1.0</version>
+  <description>
+    AI 입고 감지 — IN-1 게이트 카메라를 YOLO(best.pt)로 감시, 물품 종류 판별 후
+    /detection/inbound 발행 (task_manager가 inbound task 생성).
+    서버(도메인 12)에서 실행. pip 의존: ultralytics.
+  </description>
+  <maintainer email="difj3839@gmail.com">gustn</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

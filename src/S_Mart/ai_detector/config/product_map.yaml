@@ -1,0 +1,39 @@
+# YOLO 클래스명 → DB products.name 매핑
+# 근거: client/src/constants.ts EMOJI_MAP (DB 상품명과 일치해야 UI가 동작 → 사실상 시드 목록)
+#   상품 6종: 사과, 배, 콜라, 생선, 아이스크림, 냉동피자
+# null = 해당 클래스 감지해도 무시 (DB에 상품 없음 — 입고 task 생성 안 함)
+# ★ best.pt 갱신(2026-07-14, 17클래스)에 맞춰 정리 — 과일 세분화(fruit_*)됐으나
+#   DB 상품은 6종 유지 → 늘어난 과일/기타 클래스는 전부 무시(null).
+product_map:
+  # ── 실제 상품 6종 (DB products와 일치) ──
+  apple: 사과
+  pear: 배
+  Coke: 콜라
+  fish: 생선
+  icecream: 아이스크림
+  pizza_box: 냉동피자
+  # ── 미취급 (DB 미등록 → 무시) ──
+  Drinks: null            # 콜라 외 음료 미취급
+  other_fish: null
+  other_square: null
+  # 세분화된 과일 8종 — DB엔 개별 상품 없음(사과/배만) → 전부 무시
+  fruit_banana: null
+  fruit_dragonfruit: null
+  fruit_guava: null
+  fruit_lemon: null
+  fruit_orange: null
+  fruit_pineapple: null
+  fruit_strawberry: null
+  fruit_sugarapple: null
+
+# 상품명 → 저장타입 (DB products.storage_type와 일치해야 함)
+# 출고 감지(outbound_detector)가 미수령 타임아웃을 고를 때만 사용:
+#   chilled(냉장) 30s / frozen(냉동) 15s — 냉동은 녹으므로 대기 허용이 짧다.
+# (입고는 이 맵을 안 읽음 — product_map만 사용)
+storage_type:
+  사과: chilled
+  배: chilled
+  콜라: chilled
+  생선: frozen
+  아이스크림: frozen
+  냉동피자: frozen
