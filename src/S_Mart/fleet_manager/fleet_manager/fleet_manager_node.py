@@ -62,6 +62,9 @@ class FleetManagerNode(Node):
         # ── 발행: Path Plan Manager로 배정 지시 ─────────────────────────────
         self._pub_assignment = self.create_publisher(String, '/assignment', 10)
 
+        # ── 발행: PLACE 중 고객취소 감지 시 게이트 회수 위임 (task_manager가 reclaim 생성) ──
+        self._pub_reclaim = self.create_publisher(String, '/reclaim_request', 10)
+
         # ── DB 커넥션 (메인 스레드 전용, LISTEN 없으므로 1개로 충분) ──────────
         self._db = psycopg2.connect(_DSN)
 
@@ -145,6 +148,9 @@ class FleetManagerNode(Node):
             self._handle_source_arrived(robot_id)
         elif event == 'target_done':
             self._handle_target_done(robot_id)
+        elif event in ('cancel_aborted', 'cancel_returned'):
+            # 고객취소 보고 — order_id로 대상 task 특정(로봇에 assigned가 여러 개일 수 있음)
+            self._finish_customer_cancel(robot_id, data.get('order_id'), event)
         else:
             self.get_logger().warn(f'알 수 없는 task_report event: {event}')
 
@@ -350,25 +356,40 @@ class FleetManagerNode(Node):
                 )
 
             elif task_type == 'outbound':
-                # [트랜잭션] orders awaiting_pickup + NOTIFY order_ready 동시 커밋
-                # task는 assigned 유지 — Task Manager가 /detection/pickup|no_pickup 후 최종 처리
-                cur.execute(
-                    "UPDATE orders SET status = 'awaiting_pickup' WHERE id = %s",
-                    (order_id,)
-                )
-                # FastAPI가 LISTEN order_status_updated 수신 → WebSocket broadcast → 고객 UI 실시간 갱신
-                cur.execute(
-                    'SELECT pg_notify(%s, %s)',
-                    ('order_status_updated', json.dumps({
-                        'order_id': order_id,
-                        'status': 'awaiting_pickup',
-                    }))
-                )
-                self._db.commit()
-                self.get_logger().info(
-                    f'{robot_id} outbound 완료: task_id={task_id},'
-                    f' order_id={order_id} → awaiting_pickup'
-                )
+                # PLACE 완료 시점에 order가 이미 취소됐는지 확인(FOR UPDATE로 cancel_order와 직렬화).
+                # PLACE는 원자구간이라 취소가 와도 못 끊고 게이트에 놓인다 → 여기서 자연수렴 판정.
+                cur.execute("SELECT status FROM orders WHERE id = %s FOR UPDATE", (order_id,))
+                ostatus_row = cur.fetchone()
+                ostatus = ostatus_row[0] if ostatus_row else None
+
+                if ostatus == 'cancelled':
+                    # PLACE 중(또는 직전) 고객취소됨. 물건은 게이트에 놓임 → awaiting_pickup으로
+                    # 바꾸지 않고(cancel_reason=user 보존) task_manager에 게이트 회수 reclaim 위임.
+                    self._db.commit()   # FOR UPDATE 잠금 해제
+                    self._pub_reclaim.publish(String(data=json.dumps({'order_id': order_id})))
+                    self.get_logger().info(
+                        f'{robot_id} outbound target_done인데 order_id={order_id} 취소됨'
+                        f' → reclaim 위임(게이트 회수)')
+                else:
+                    # [트랜잭션] orders awaiting_pickup + NOTIFY 동시 커밋
+                    # task는 assigned 유지 — Task Manager가 /detection/pickup|no_pickup 후 최종 처리
+                    cur.execute(
+                        "UPDATE orders SET status = 'awaiting_pickup' WHERE id = %s",
+                        (order_id,)
+                    )
+                    # FastAPI가 LISTEN order_status_updated 수신 → WebSocket broadcast → 고객 UI 갱신
+                    cur.execute(
+                        'SELECT pg_notify(%s, %s)',
+                        ('order_status_updated', json.dumps({
+                            'order_id': order_id,
+                            'status': 'awaiting_pickup',
+                        }))
+                    )
+                    self._db.commit()
+                    self.get_logger().info(
+                        f'{robot_id} outbound 완료: task_id={task_id},'
+                        f' order_id={order_id} → awaiting_pickup'
+                    )
 
             # LRU 갱신: 임무 완료 시각 기록 (task 타입 무관)
             self._last_used[robot_id] = time.time()
@@ -376,6 +397,63 @@ class FleetManagerNode(Node):
         except Exception as e:
             self._db.rollback()
             self.get_logger().error(f'target_done 처리 실패 ({robot_id}): {e}')
+
+    def _finish_customer_cancel(self, robot_id: str, order_id, kind: str):
+        """고객취소 로봇 보고 처리 (방식1 자체반납).
+
+          cancel_aborted  : TO_SOURCE(빈손) 중단 — 물건 안 움직임
+          cancel_returned : TO_TARGET 자체반납 완료 — 로봇이 선반에 되돌려놓음
+
+        두 경우 DB 효과는 동일: outbound task cancelled + 선반 예약(reserved_by)만 해제.
+        outbound 동안 선반 product_name은 안 비워지므로(수령 확정 때만 비움) 재고는 원래
+        그대로다 → product_name/inbound_at 손대지 않는다(inbound_at=now()는 재고 나이 오염).
+        order는 서버가 cancelled(user)로 해둠 → 안 건드림.
+        """
+        if order_id is None:
+            self.get_logger().error(f'{kind}: order_id 없음 ({robot_id}) — 대상 특정 불가')
+            return
+        cur = self._db.cursor()
+        try:
+            now = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                SELECT id, source_location_id FROM tasks
+                WHERE order_id = %s AND type = 'outbound'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (order_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                self.get_logger().warn(f'{kind}: order_id={order_id} outbound task 없음 (무시)')
+                self._db.rollback()
+                return
+            task_id, slot = row
+
+            cur.execute(
+                "UPDATE tasks SET status = 'cancelled', completed_at = %s WHERE id = %s",
+                (now, task_id)
+            )
+            cur.execute(
+                'UPDATE locations SET reserved_by = NULL WHERE location_id = %s',
+                (slot,)
+            )
+            cur.execute(
+                """
+                INSERT INTO event_logs (task_id, event, robot_id, occurred_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (task_id, 'cancelled', robot_id, now)
+            )
+            self._db.commit()
+            self._last_used[robot_id] = time.time()   # 로봇은 이제 자유 — LRU 갱신
+            self.get_logger().info(
+                f'{robot_id} {kind}: task_id={task_id}(order_id={order_id}) cancelled,'
+                f' 선반 {slot} 예약 해제')
+
+        except Exception as e:
+            self._db.rollback()
+            self.get_logger().error(f'{kind} 처리 실패 ({robot_id}, order_id={order_id}): {e}')
 
     # ── 대기 임무 확인 ────────────────────────────────────────────────────────
 

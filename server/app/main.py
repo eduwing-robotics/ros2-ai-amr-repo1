@@ -274,7 +274,9 @@ async def get_order(order_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.post("/orders/{order_id}/cancel", response_model=OrderResponse)
 async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
-    order = await db.get(Order, order_id)
+    # FOR UPDATE: Fleet Manager의 target_done(awaiting_pickup 전환)과 같은 행을 두고 경합할 수
+    # 있어 order 행을 잠근다. 둘 다 잠그면 "취소 vs 배달완료"가 직렬화된다.
+    order = await db.get(Order, order_id, with_for_update=True)
     if not order:
         raise HTTPException(status_code=404, detail="주문을 찾을 수 없습니다.")
 
@@ -283,6 +285,11 @@ async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
 
     order.status = OrderStatus.cancelled
     order.cancel_reason = CancelReason.user
+
+    # 로봇 계층으로 취소 전파: Task Manager가 LISTEN order_cancelled 수신 → 로봇 상태별 대응.
+    # (WebSocket broadcast는 브라우저 UI 갱신용이고, 로봇 계층은 이 NOTIFY로만 취소를 안다.)
+    payload = json.dumps({"order_id": order.id})
+    await db.execute(text(f"NOTIFY order_cancelled, '{payload}'"))
     await db.commit()
     await db.refresh(order)
 

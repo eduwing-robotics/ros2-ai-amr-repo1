@@ -79,6 +79,13 @@ class TaskManagerNode(Node):
         # Fleet Manager로 새 task 알림
         self._pub = self.create_publisher(String, '/new_task', 10)
 
+        # 고객 능동 취소 → 로봇에 취소 신호 (도메인 브릿지가 12→30/31 중계)
+        # 로봇이 payload의 robot_id로 필터. order_id는 로봇이 보고에 되싣어 fleet이 대상 특정.
+        self._cancel_pub = self.create_publisher(String, '/cancel_mission', 10)
+
+        # PLACE 중 취소(자연수렴) → fleet이 게이트 회수 reclaim을 위임하는 요청
+        self.create_subscription(String, '/reclaim_request', self._on_reclaim_request, 10)
+
         # 입고 감지 — 카메라가 IN-1 게이트에서 상품명만 감지하여 발행
         # {"product_name": "사과"} — 슬롯은 Task Manager가 선택
         self.create_subscription(String, '/detection/inbound', self._on_inbound, 10)
@@ -110,7 +117,8 @@ class TaskManagerNode(Node):
         cur = self._listen_conn.cursor()
         cur.execute('LISTEN new_order')
         cur.execute('LISTEN order_status_updated')
-        self.get_logger().info('LISTEN new_order, order_status_updated 등록 완료')
+        cur.execute('LISTEN order_cancelled')
+        self.get_logger().info('LISTEN new_order, order_status_updated, order_cancelled 등록 완료')
 
         while rclpy.ok():
             # 5초마다 종료 신호 체크 (rclpy.ok()가 False가 되면 루프 탈출)
@@ -121,6 +129,8 @@ class TaskManagerNode(Node):
                         payload = json.loads(notify.payload)
                         if notify.channel == 'new_order':
                             self._create_outbound_task(payload['order_id'])
+                        elif notify.channel == 'order_cancelled':
+                            self._on_order_cancelled(payload['order_id'])
                         elif payload.get('status') == 'awaiting_pickup':
                             self._arm_pickup_timer(payload['order_id'])
                     except Exception as e:
@@ -165,6 +175,78 @@ class TaskManagerNode(Node):
         except Exception as e:
             self._sub_db.rollback()
             self.get_logger().error(f'미수령 타이머 등록 실패 (order_id={order_id}): {e}')
+
+    def _on_order_cancelled(self, order_id):
+        """LISTEN order_cancelled (서브 스레드) → 고객 능동 취소를 로봇 계층으로 전파.
+
+        order는 서버가 이미 cancelled(user)로 만들어둠. 여기선 outbound task 상태로 분기:
+          - pending  : 아직 로봇 미배정 → task 취소 + 선반 예약만 해제. 로봇 신호 불필요.
+          - assigned : 로봇 수행 중 → /cancel_mission 신호 + cancel_requested_at 스탬프.
+                       DB 최종 처리는 로봇 보고를 받는 fleet이 함(로봇이 어느 상태서 멈출지
+                       여기선 모름 — idle/busy/error 3종만 밖에서 보임).
+        서브 스레드 전용 _sub_db 사용.
+        """
+        cur = self._sub_db.cursor()
+        try:
+            now = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                SELECT id, status, robot_id, source_location_id FROM tasks
+                WHERE order_id = %s AND type = 'outbound'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (order_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                self.get_logger().warn(f'취소: order_id={order_id} outbound task 없음 — 무시')
+                self._sub_db.rollback()
+                return
+            task_id, status, robot_id, shelf = row
+
+            if status in ('done', 'cancelled'):
+                self.get_logger().info(f'취소: order_id={order_id} task 이미 {status} — 무시')
+                self._sub_db.rollback()
+                return
+
+            if status == 'pending':
+                cur.execute(
+                    "UPDATE tasks SET status = 'cancelled', completed_at = %s WHERE id = %s",
+                    (now, task_id)
+                )
+                # 물건 안 움직였으므로 선반 예약(reserved_by)만 해제 — product_name/inbound_at 유지
+                cur.execute(
+                    'UPDATE locations SET reserved_by = NULL WHERE location_id = %s',
+                    (shelf,)
+                )
+                cur.execute(
+                    'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
+                    (task_id, 'cancelled', now)
+                )
+                self._sub_db.commit()
+                self.get_logger().info(
+                    f'취소(pending): order_id={order_id} task_id={task_id} cancelled, 선반 {shelf} 예약 해제')
+                return
+
+            if status == 'assigned':
+                # 반납 중 로봇 사망 대비 흔적 남김(죽어있던 cancel_requested_at 컬럼 활용)
+                cur.execute(
+                    'UPDATE tasks SET cancel_requested_at = %s WHERE id = %s',
+                    (now, task_id)
+                )
+                self._sub_db.commit()
+                if robot_id:
+                    self._cancel_pub.publish(String(data=json.dumps(
+                        {'robot_id': robot_id, 'order_id': order_id})))
+                    self.get_logger().info(
+                        f'취소(assigned): order_id={order_id} → /cancel_mission {robot_id}')
+                else:
+                    self.get_logger().warn(
+                        f'취소(assigned): order_id={order_id} robot_id 없음 — 신호 못 보냄')
+
+        except Exception as e:
+            self._sub_db.rollback()
+            self.get_logger().error(f'취소 처리 실패 (order_id={order_id}): {e}')
 
     # ── 메인 스레드: 1Hz 미수령 검사 ──────────────────────────────────────────
 
@@ -309,8 +391,62 @@ class TaskManagerNode(Node):
             self._main_db.rollback()
             self.get_logger().error(f'수령 처리 실패: {e}')
 
+    def _create_reclaim(self, cur, order_id, now):
+        """게이트에 놓인 상품을 원래 선반으로 되돌리는 reclaim task 생성 (공용 헬퍼).
+
+        미수령(no_pickup)과 고객취소(user·PLACE 자연수렴)가 공유한다. order 상태·
+        cancel_reason은 여기서 안 건드린다(호출자 책임 — 미수령은 no_pickup 설정, 고객취소는
+        서버가 이미 user로 해둠). 호출자의 트랜잭션 안에서 실행, commit 안 함.
+
+        reclaim source = outbound의 target(물건이 놓인 게이트), target = outbound의 source(선반).
+        슬롯 잠금은 outbound → reclaim로 교체(슬롯 해방하지 않고 reclaim 완료까지 유지).
+        반환: reclaim_task_id (outbound task 없으면 None).
+        """
+        cur.execute(
+            """
+            SELECT id, source_location_id, product_name, target_location_id FROM tasks
+            WHERE order_id = %s AND type = 'outbound'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (order_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            self.get_logger().error(f'order_id={order_id}의 outbound task 없음')
+            return None
+        outbound_task_id, shelf, product_name, gate = row
+
+        cur.execute(
+            "UPDATE tasks SET status = 'cancelled', completed_at = %s WHERE id = %s",
+            (now, outbound_task_id)
+        )
+        cur.execute(
+            """
+            INSERT INTO tasks
+                (type, status, product_name, order_id,
+                 source_location_id, target_location_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            ('reclaim', 'pending', product_name, order_id, gate, shelf, now)
+        )
+        reclaim_task_id = cur.fetchone()[0]
+        cur.execute(
+            'UPDATE locations SET reserved_by = %s WHERE location_id = %s',
+            (reclaim_task_id, shelf)
+        )
+        cur.execute(
+            'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
+            (outbound_task_id, 'cancelled', now)
+        )
+        cur.execute(
+            'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
+            (reclaim_task_id, 'created', now)
+        )
+        return reclaim_task_id
+
     def _cancel_and_reclaim(self, slot):
-        """미수령 → outbound task cancelled + reclaim task 생성 + 슬롯 잠금 유지.
+        """미수령 → order cancelled(no_pickup) + reclaim task 생성 + 슬롯 잠금 유지.
 
         slot(OUT-1/OUT-2)의 awaiting_pickup 주문만 처리 (2공간 구분).
         해당 주문 없으면 = 이미 수령됐거나 처리됨 → 경고 후 종료.
@@ -337,29 +473,7 @@ class TaskManagerNode(Node):
                 return
             order_id = order_row[0]
 
-            # outbound task 조회 (target_location_id = 물건이 놓인 출고 게이트)
-            cur.execute(
-                """
-                SELECT id, source_location_id, product_name, target_location_id FROM tasks
-                WHERE order_id = %s AND type = 'outbound'
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (order_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                self.get_logger().error(f'order_id={order_id}의 outbound task 없음')
-                self._main_db.rollback()
-                return
-            outbound_task_id, original_slot, product_name, out_gate = row
-
-            # outbound task = cancelled (임무 실패 — 고객 미수령)
-            cur.execute(
-                "UPDATE tasks SET status = 'cancelled', completed_at = %s WHERE id = %s",
-                (now, outbound_task_id)
-            )
-
-            # order = cancelled (no_pickup)
+            # order = cancelled (no_pickup) — 취소 사유 설정은 미수령 경로 몫
             cur.execute(
                 """
                 UPDATE orders SET status = 'cancelled', cancel_reason = 'no_pickup'
@@ -367,7 +481,6 @@ class TaskManagerNode(Node):
                 """,
                 (order_id,)
             )
-            # FastAPI WebSocket broadcast 트리거 (고객 UI 실시간 갱신)
             cur.execute(
                 'SELECT pg_notify(%s, %s)',
                 ('order_status_updated', json.dumps({
@@ -377,41 +490,14 @@ class TaskManagerNode(Node):
                 }))
             )
 
-            # reclaim task 생성 (source: 물건이 놓인 출고 게이트, target: 원래 슬롯)
-            cur.execute(
-                """
-                INSERT INTO tasks
-                    (type, status, product_name, order_id,
-                     source_location_id, target_location_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                ('reclaim', 'pending', product_name, order_id, out_gate, original_slot, now)
-            )
-            reclaim_task_id = cur.fetchone()[0]
-
-            # 슬롯 잠금을 outbound_task_id → reclaim_task_id로 교체
-            # (슬롯을 해방하지 않고 reclaim 임무가 완료될 때까지 잠금 유지)
-            cur.execute(
-                'UPDATE locations SET reserved_by = %s WHERE location_id = %s',
-                (reclaim_task_id, original_slot)
-            )
-
-            cur.execute(
-                'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
-                (outbound_task_id, 'cancelled', now)
-            )
-            cur.execute(
-                'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
-                (reclaim_task_id, 'created', now)
-            )
-
+            reclaim_task_id = self._create_reclaim(cur, order_id, now)
+            if reclaim_task_id is None:
+                self._main_db.rollback()
+                return
             self._main_db.commit()
 
             self.get_logger().info(
-                f'미수령: order_id={order_id}, outbound task_id={outbound_task_id} cancelled, '
-                f'reclaim task_id={reclaim_task_id}, slot={original_slot} 잠금 유지'
-            )
+                f'미수령: order_id={order_id} (slot={slot}) → reclaim task_id={reclaim_task_id} 생성, 슬롯 잠금 유지')
             self._pub.publish(
                 String(data=json.dumps({'task_id': reclaim_task_id, 'task_type': 'reclaim'}))
             )
@@ -419,6 +505,34 @@ class TaskManagerNode(Node):
         except Exception as e:
             self._main_db.rollback()
             self.get_logger().error(f'미수령 처리 실패: {e}')
+
+    def _on_reclaim_request(self, msg: String):
+        """fleet이 PLACE 중 고객취소를 감지 → 게이트에 놓인 상품을 선반으로 되돌릴 reclaim 요청.
+
+        order는 서버가 이미 cancelled(user)로 해둠 → order 상태·cancel_reason 안 건드림.
+        메인 스레드 콜백이므로 _main_db 사용.
+        """
+        try:
+            order_id = json.loads(msg.data)['order_id']
+        except Exception as e:
+            self.get_logger().error(f'reclaim_request 파싱 실패: {e}')
+            return
+        cur = self._main_db.cursor()
+        try:
+            now = datetime.now(timezone.utc)
+            reclaim_task_id = self._create_reclaim(cur, order_id, now)
+            if reclaim_task_id is None:
+                self._main_db.rollback()
+                return
+            self._main_db.commit()
+            self.get_logger().info(
+                f'취소(PLACE) 회수: order_id={order_id} → reclaim task_id={reclaim_task_id}')
+            self._pub.publish(
+                String(data=json.dumps({'task_id': reclaim_task_id, 'task_type': 'reclaim'}))
+            )
+        except Exception as e:
+            self._main_db.rollback()
+            self.get_logger().error(f'reclaim_request 처리 실패 (order_id={order_id}): {e}')
 
     # ── task INSERT 함수들 ─────────────────────────────────────────────────────
 
