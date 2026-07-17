@@ -7,6 +7,8 @@
     임무 단계 실패 → ERROR (배정 제외, fsm> reset으로 IDLE 복귀)
     RETURNING 중 배정 → 세그먼트 경계에서 TO_SOURCE (preempt)
     수동 주행/수렴 회전/init → MANUAL (busy 발행으로 fleet 배정 차단)
+    고객취소(빈손 TO_SOURCE) → IDLE (임무 폐기, cancel_aborted 보고 후 복귀)
+    고객취소(물건 든 뒤) → 원래 선반으로 TO_TARGET→PLACE 반납 (cancel_returned)
 
 전이는 RobotFSM._set_state() 한 곳으로만 수행한다. 테이블에 없는 전이는
 경고 로그만 남기고 통과 — 실기 운용 중 FSM을 세우는 것보다 버그를
@@ -29,7 +31,7 @@ class S(Enum):
 # 허용 전이 테이블 (자기 자신으로의 전이는 항상 무시·허용)
 TRANSITIONS = {
     S.IDLE:      {S.TO_SOURCE, S.RETURNING, S.MANUAL},
-    S.TO_SOURCE: {S.PICK, S.ERROR},
+    S.TO_SOURCE: {S.PICK, S.IDLE, S.ERROR},       # IDLE = 고객취소 빈손 중단
     S.PICK:      {S.TO_TARGET, S.ERROR},
     S.TO_TARGET: {S.PLACE, S.ERROR},
     S.PLACE:     {S.IDLE, S.ERROR},
