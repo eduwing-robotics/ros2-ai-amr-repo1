@@ -614,7 +614,7 @@ class TaskManagerNode(Node):
 
         except Exception as e:
             self._main_db.rollback()
-            raise
+            self.get_logger().error(f'inbound task 생성 실패: {e}')
 
     def destroy_node(self):
         self._listen_conn.close()

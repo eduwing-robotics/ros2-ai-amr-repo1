@@ -238,9 +238,18 @@ class FleetManagerNode(Node):
         try:
             now = datetime.now(timezone.utc)
 
-            # 해당 로봇의 assigned task 조회
+            # 해당 로봇의 assigned task 조회.
+            # outbound는 target_done 후에도 assigned를 유지(pickup 확인까지)하므로 한 로봇에
+            # assigned가 2개 공존할 수 있다 → picked_at IS NULL로 아직 안 집은 것만,
+            # assigned_at DESC로 가장 최근 배정분을 고른다. ORDER BY 없는 LIMIT 1은
+            # 어느 행이 나올지 정의되지 않아 이전 task의 picked_at을 덮어쓸 수 있다.
             cur.execute(
-                "SELECT id FROM tasks WHERE robot_id = %s AND status = 'assigned'",
+                """
+                SELECT id FROM tasks
+                WHERE robot_id = %s AND status = 'assigned' AND picked_at IS NULL
+                ORDER BY assigned_at DESC
+                LIMIT 1
+                """,
                 (robot_id,)
             )
             row = cur.fetchone()
@@ -286,11 +295,16 @@ class FleetManagerNode(Node):
         try:
             now = datetime.now(timezone.utc)
 
-            # 해당 로봇의 assigned task 상세 조회
+            # 해당 로봇의 assigned task 상세 조회.
+            # source_arrived와 같은 이유로 ORDER BY 필수 — 지금 막 내려놓은 건 가장 최근
+            # 배정분이다. 이전 outbound(assigned + awaiting_pickup)를 잡으면 안 된다.
             cur.execute(
                 """
                 SELECT id, type, target_location_id, product_name, order_id
-                FROM tasks WHERE robot_id = %s AND status = 'assigned'
+                FROM tasks
+                WHERE robot_id = %s AND status = 'assigned'
+                ORDER BY assigned_at DESC
+                LIMIT 1
                 """,
                 (robot_id,)
             )

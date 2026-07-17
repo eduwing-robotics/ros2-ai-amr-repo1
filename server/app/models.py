@@ -55,6 +55,7 @@ class TaskStatus(enum.Enum):
 class TaskEvent(enum.Enum):
     created   = "created"
     assigned  = "assigned"
+    picked    = "picked"     # 소스 도착 + 집기 완료 (fleet_manager _handle_source_arrived)
     timed_out = "timed_out"
     done      = "done"
     cancelled = "cancelled"
