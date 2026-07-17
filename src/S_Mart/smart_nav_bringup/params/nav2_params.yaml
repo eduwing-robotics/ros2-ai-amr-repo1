@@ -60,8 +60,13 @@ bt_navigator:
     robot_base_frame: base_link
     transform_tolerance: 0.5
     filter_duration: 0.3
-    default_nav_to_pose_bt_xml: "$(find-pkg-share smart_nav_bringup)/behavior_trees/smart_navigate.xml" # 커스텀 트리: plan-once + wait-only recovery (사람정지 확장 예정)
+    default_nav_to_pose_bt_xml: "$(find-pkg-share smart_nav_bringup)/behavior_trees/smart_navigate.xml" # 커스텀 트리: plan-once + wait-only recovery + 사람정지 게이트
     default_nav_through_poses_bt_xml: "$(find-pkg-share nav2_bt_navigator)/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
+    # 커스텀 BT 플러그인만 나열 (Jazzy는 내장 노드 자동 등록 → 기본목록 안 적어도 됨).
+    # smart_human_stop_condition_bt_node = smart_bt_plugins의 HumanStopCondition
+    #   (/human_stop=true 시 FollowPath halt). 라이브러리명 = CMake add_library 타깃명.
+    plugin_lib_names:
+      - smart_human_stop_condition_bt_node
     always_reload_bt_xml: false
     goal_blackboard_id: goal
     goals_blackboard_id: goals

@@ -1,6 +1,6 @@
 <!--
-  smart_navigate — S-Mart 커스텀 navigate_to_pose 트리 (최종 트리, 확장 예정)
-  현재: plan-once + wait-only recovery. 향후: 사람 발견 정지(BT 게이트) 추가 예정.
+  smart_navigate — S-Mart 커스텀 navigate_to_pose 트리
+  현재: plan-once + wait-only recovery + 사람정지 게이트(HumanStopCondition).
   기본 navigate_to_pose_w_replanning_and_recovery.xml 에서:
    - plan-once: PipelineSequence(매 tick 전체 재실행) → Sequence(memory)로 교체.
      ComputePathToPose는 처음 1회 성공 후 재실행 안 됨 → 이후 FollowPath만.
@@ -20,7 +20,14 @@
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <Sequence name="NavigatePlanOnce">
         <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}"/>
-        <FollowPath path="{path}" controller_id="FollowPath" error_code_id="{follow_path_error_code}"/>
+        <!-- 사람 정지 게이트: ReactiveSequence는 매 tick 자식 재검사.
+             HumanStopCondition이 사람있음(/human_stop=true)이면 RUNNING 반환 →
+             ReactiveSequence가 FollowPath를 halt → 로봇 정지. 사라지면 SUCCESS → 재개.
+             FAILURE 안 냄 → RecoveryNode의 Wait 미발동(사람정지가 복구 오발 안 시킴). -->
+        <ReactiveSequence name="HumanGate">
+          <HumanStopCondition topic="/human_stop"/>
+          <FollowPath path="{path}" controller_id="FollowPath" error_code_id="{follow_path_error_code}"/>
+        </ReactiveSequence>
       </Sequence>
       <Wait wait_duration="5.0"/>
     </RecoveryNode>
