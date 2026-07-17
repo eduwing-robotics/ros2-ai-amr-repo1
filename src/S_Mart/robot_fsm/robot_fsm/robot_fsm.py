@@ -130,6 +130,8 @@ class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
 
         # ── fleet ───────────────────────────────────────────
         self.create_subscription(String, '/assignment', self._on_assignment, 10)
+        # 고객 주문취소 — {robot_id, order_id}. 자기 것만 처리(assignment와 동일 필터).
+        self.create_subscription(String, '/cancel_mission', self._on_cancel_mission, 10)
         self._report_pub = self.create_publisher(String, '/task_report', 10)
         self._status_pub = self.create_publisher(String, '/robot_status', 10)
         self.create_timer(1.0, self._publish_status)
@@ -138,6 +140,10 @@ class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
         self._resp_ev = threading.Event()
         self.current = None              # 현재(마지막 도착) 노드
         self._queue = queue.Queue()      # 수신된 /assignment 대기열
+        # 취소 요청된 order_id (없으면 None). 콜백(executor 스레드)이 세팅,
+        # 워커 스레드가 travel 세그먼트 경계에서 읽어 'cancelled' 반환 후 소비.
+        # 파이썬 속성 대입은 GIL로 원자적이라 별도 락 불필요.
+        self._cancel_order_id = None
         self._state = S.IDLE             # 상태 정의·전이 = states.py
         self.get_logger().info(f'[{self.robot}] FSM 시작 (홈: {self.home["node"]})')
 
@@ -199,10 +205,25 @@ class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
     def _publish_status(self):
         self._status_pub.publish(String(data=self._ext_status()))
 
-    def _report(self, event):
-        payload = json.dumps({'robot_id': self.robot, 'event': event})
-        self._report_pub.publish(String(data=payload))
+    def _report(self, event, order_id=None):
+        payload = {'robot_id': self.robot, 'event': event}
+        if order_id is not None:
+            payload['order_id'] = order_id      # 취소 이벤트: fleet이 대상 task 특정용
+        self._report_pub.publish(String(data=json.dumps(payload)))
         self.get_logger().info(f'[{self.robot}] task_report: {event}')
+
+    def _on_cancel_mission(self, msg):
+        """고객 주문취소 신호 — {robot_id, order_id}. 자기 것이면 플래그만 세운다.
+        실제 중단은 워커 스레드가 travel 세그먼트 경계(노드 위)에서 처리(안전)."""
+        try:
+            d = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if d.get('robot_id') != self.robot:
+            return
+        self._cancel_order_id = d.get('order_id')
+        self.get_logger().warn(
+            f'[{self.robot}] 주문취소 신호 수신: order_id={self._cancel_order_id}')
 
     # ── 콜백 ─────────────────────────────────────────────────
 
@@ -273,25 +294,70 @@ class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
         self.get_logger().info(f'[{self.robot}] 임무 시작: {a["source"]} → {a["target"]}')
 
         self._set_state(S.TO_SOURCE)
-        if self._travel(src['node'], laden=False) != 'done':
+        r = self._travel(src['node'], laden=False)
+        if r == 'cancelled':
+            return self._cancel_aborted()       # 빈손 중단 — 물건 안 건드림
+        if r != 'done':
             return False
+
         self._set_state(S.PICK)
-        if not self._work(src, pick=True):
+        if not self._work(src, pick=True):       # PICK은 원자구간 — 중간 중단 안 함
             return False
+        # PICK 도중 취소가 왔으면 여기서 확인 → 물건 들었으니 반납 경로
+        if self._cancel_order_id is not None:
+            return self._cancel_return(src)
         self._report('source_arrived')
 
         self._set_state(S.TO_TARGET)
-        if self._travel(tgt['node'], laden=True) != 'done':
+        r = self._travel(tgt['node'], laden=True)
+        if r == 'cancelled':
+            return self._cancel_return(src)      # 물건 들고 있음 → 원래 선반으로 반납
+        if r != 'done':
             return False
+
         self._set_state(S.PLACE)
-        if not self._work(tgt, pick=False):
+        if not self._work(tgt, pick=False):      # PLACE도 원자구간 — 취소 와도 완료
             return False
+        # PLACE 중 취소는 여기서 안 다룸 — 게이트에 놓은 뒤 fleet이 target_done 시점에
+        # order가 cancelled면 reclaim으로 자연수렴 처리(방식 확정). 플래그만 정리.
+        self._cancel_order_id = None
         self._report('target_done')
 
         self._set_state(S.IDLE)
         self._publish_status()           # 1Hz 타이머 안 기다리고 즉시 idle 발행
                                          # → fleet이 CHAIN_WAIT(1.5s) 안에 배정 가능
         self.get_logger().info(f'[{self.robot}] 임무 완료: {a["source"]} → {a["target"]}')
+        return True
+
+    def _cancel_aborted(self):
+        """TO_SOURCE(빈손) 중 고객취소 — 임무 폐기. 물건을 안 집었으니 되돌릴 것 없음.
+        cancel_aborted 보고 → fleet이 outbound task cancelled + 선반 예약 해제.
+        True 반환 = 임무 정상 종료(에러 아님) → 워커가 홈 복귀."""
+        oid = self._cancel_order_id
+        self._cancel_order_id = None
+        self._set_state(S.IDLE)
+        self._report('cancel_aborted', order_id=oid)
+        self._publish_status()
+        self.get_logger().info(f'[{self.robot}] 주문취소(빈손 중단): order_id={oid}')
+        return True
+
+    def _cancel_return(self, src):
+        """물건 든 상태에서 고객취소 — 원래 선반(src)으로 되돌려 놓는다(자체 swap).
+        target을 선반으로 바꿔 laden 이동 → PLACE(반납). cancel_returned 보고 →
+        fleet이 outbound task cancelled + 선반 예약 해제(재고는 원래대로 유지)."""
+        oid = self._cancel_order_id
+        self._cancel_order_id = None      # 반납 이동 중 재취소 방지 위해 먼저 소비
+        self.get_logger().info(f'[{self.robot}] 주문취소(선반 반납 시작): order_id={oid}')
+        self._set_state(S.TO_TARGET)
+        if self._travel(src['node'], laden=True) != 'done':
+            return False                  # 반납 이동 실패 → ERROR
+        self._set_state(S.PLACE)
+        if not self._work(src, pick=False):
+            return False
+        self._set_state(S.IDLE)
+        self._report('cancel_returned', order_id=oid)
+        self._publish_status()
+        self.get_logger().info(f'[{self.robot}] 주문취소(선반 반납 완료): order_id={oid}')
         return True
 
     def _return_home(self):

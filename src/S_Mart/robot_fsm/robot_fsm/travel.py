@@ -51,6 +51,9 @@ class TravelMixin:
         반환: 'done' | 'preempted' | 'failed'
         """
         while rclpy.ok():                # 경로 요청 — 시작 노드 점유 등이면 재시도
+            # 고객취소: 아직 주행 시작 전(노드 위)이라 안전하게 즉시 중단
+            if self._cancel_order_id is not None:
+                return 'cancelled'
             resp = self._transact({'type': 'route', 'start': self.current,
                                    'goal': goal_node, 'laden': laden})
             if resp and resp.get('type') == 'route':
@@ -63,6 +66,9 @@ class TravelMixin:
             time.sleep(1.0)
 
         while rclpy.ok():
+            # 고객취소: 세그먼트 경계(노드 위)에서만 중단 — preempt와 동일 안전지점
+            if self._cancel_order_id is not None:
+                return 'cancelled'
             if preempt and not self._queue.empty():
                 return 'preempted'       # 세그먼트 경계 = 노드 위에서만 전환
             resp = self._transact({'type': 'segment'})
