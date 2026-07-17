@@ -43,6 +43,17 @@ topics:
     from_domain: 12
     to_domain: 31
 
+  # 서버 → 로봇: 주문 취소 신호 (12->30, 12->31) — 로봇이 robot_id로 필터.
+  # order_id는 로봇이 /task_report에 되싣어 fleet이 대상 task를 특정.
+  cancel_mission:
+    type: std_msgs/msg/String
+    from_domain: 12
+    to_domain: 30
+  cancel_mission:
+    type: std_msgs/msg/String
+    from_domain: 12
+    to_domain: 31
+
   # 로봇 → 서버: 임무 보고 (픽/플레이스 시퀀스 완료 시)
   task_report:
     type: std_msgs/msg/String
