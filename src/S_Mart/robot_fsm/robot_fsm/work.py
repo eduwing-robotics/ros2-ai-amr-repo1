@@ -41,7 +41,7 @@ class WorkMixin:
         for h in seq['before_dock']:
             if not self._fork(h):
                 return False
-        if not self._work_dock(loc.get('marker')):
+        if not self._work_dock(loc.get('marker'), loc.get('target_y', 0.0)):
             return False
         for h in seq['after_dock']:
             if not self._fork(h):
@@ -121,19 +121,38 @@ class WorkMixin:
 
     # ── 도킹 (aruco_docking dock_controller) ──────────────────
 
-    def _work_dock(self, marker_id=None):
-        """작업 도킹 — aruco_docking `/start_work_dock` (전진 PBVS 정밀, blocking→bool).
+    def _work_dock(self, marker_id=None, target_y=0.0):
+        """작업 도킹 — `dock_controller`의 `/start_work_dock` (blocking→bool).
 
-        marker_id 지정 시 estimator target_marker_id를 먼저 세팅(타겟 도킹 —
-        엉뚱한 마커 방지). 실패 시 임무 실패로 전파.
+        work 경로는 staging 방식(STAGE_GOTO→APPROACH)으로 dock_controller에 통합됨(2026-07-17).
+        최종 접근을 마커 **위치(m_y)** 로 조향 → 도크별 법선 오프셋 영향 없음.
+
+        marker_id → estimator target_marker_id (엉뚱한 마커 방지).
+        target_y  → 도크별 lateral 목표(`/capture_lateral`로 teach한 값). 0 = 마커 정중앙.
+        둘 다 best-effort 세팅. 실패 시 임무 실패로 전파.
         """
         if marker_id is not None:
             self._set_estimator_marker(int(marker_id))
-        self.get_logger().info(f'[{self.robot}] 작업 도킹 시작 (marker={marker_id})')
+        self._set_work_target_y(float(target_y))
+        self.get_logger().info(
+            f'[{self.robot}] 작업 도킹 시작 (marker={marker_id}, target_y={target_y:+.4f})')
         ok = self._call_trigger(self._work_dock_cli, '/start_work_dock', timeout=90.0)
         if marker_id is not None:
             self._set_estimator_marker(-1)   # 도킹 끝 → 타겟 해제 (평소=아무 마커)
         return ok
+
+    def _set_work_target_y(self, y):
+        """dock_controller target_marker_y 세팅(best-effort). 노드가 도킹 시작 시 1회 읽어 캐시한다."""
+        if not self._work_param_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn(
+                f'[{self.robot}] dock_controller param 서비스 없음 → target_marker_y 미설정(0)')
+            return
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name='target_marker_y',
+            value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(y)))]
+        self._await_future(self._work_param_cli.call_async(req), timeout=3.0)
+        self.get_logger().info(f'[{self.robot}] work target_marker_y={y:+.4f}')
 
     def _home_dock(self):
         """홈 후진 도킹 — 도크 방향 회전 후 `/start_home_dock` (정렬→180°→후진 안착).

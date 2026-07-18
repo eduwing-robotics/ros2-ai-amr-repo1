@@ -7,18 +7,22 @@
 # level: 포크 시퀀스 선택 (fork.py pick/place_sequence). 게이트는 바닥 팔레트 = 1.
 # marker: 각 도크의 ArUco 마커 ID(DICT_4X4_50). FSM이 도킹 전 estimator target_marker_id로
 #   세팅(타겟 도킹). 같은 랙 L1/L2는 마커 공유(층은 포크 높이 차이). 9개(랙4+게이트3+홈2).
+# target_y: 도킹 시 마커의 base_link y 목표(m). staging 노드가 최종 접근을 m_y→target_y 로 조향.
+#   0 = 마커 정중앙. **teach로 채운다**: 로봇을 포크가 들어갈 자리에 세우고
+#   `ros2 service call /capture_lateral std_srvs/srv/Trigger` → 반환된 m_y 를 여기 적는다.
+#   (도크별 마커 법선 오프셋을 β/lat_off 로 손튜닝하던 걸 대체 — 2026-07-15)
 locations:
-  A1-L1: {node: N1,  level: 1, dock: W, marker: 0}
-  A1-L2: {node: N1,  level: 2, dock: W, marker: 0}
-  A2-L1: {node: N6,  level: 1, dock: W, marker: 1}
-  A2-L2: {node: N6,  level: 2, dock: W, marker: 1}
-  B1-L1: {node: N16, level: 1, dock: W, marker: 2}
-  B1-L2: {node: N16, level: 2, dock: W, marker: 2}
-  B2-L1: {node: N21, level: 1, dock: W, marker: 3}
-  B2-L2: {node: N21, level: 2, dock: W, marker: 3}
-  IN-1:  {node: N10, level: 1, dock: E, marker: 4}
-  OUT-1: {node: N5,  level: 1, dock: E, marker: 5}
-  OUT-2: {node: N5,  level: 1, dock: N, marker: 6}
+  A1-L1: {node: N1,  level: 1, dock: W, marker: 0, target_y: 0.0}
+  A1-L2: {node: N1,  level: 2, dock: W, marker: 0, target_y: 0.0}
+  A2-L1: {node: N6,  level: 1, dock: W, marker: 1, target_y: 0.0}
+  A2-L2: {node: N6,  level: 2, dock: W, marker: 1, target_y: 0.0}
+  B1-L1: {node: N16, level: 1, dock: W, marker: 2, target_y: 0.0}
+  B1-L2: {node: N16, level: 2, dock: W, marker: 2, target_y: 0.0}
+  B2-L1: {node: N21, level: 1, dock: W, marker: 3, target_y: 0.0}
+  B2-L2: {node: N21, level: 2, dock: W, marker: 3, target_y: 0.0}
+  IN-1:  {node: N10, level: 1, dock: E, marker: 4, target_y: 0.0}
+  OUT-1: {node: N5,  level: 1, dock: E, marker: 5, target_y: 0.0}
+  OUT-2: {node: N5,  level: 1, dock: N, marker: 6, target_y: 0.0}
 
 # 로봇별 홈 노드 (RETURNING 목적지) + 대기 방향.
 # 홈 진입 = 전진 정밀 도킹(work_dock 재사용, 2026-07-08). marker 7·8 (홈 도킹 배선 시 사용).

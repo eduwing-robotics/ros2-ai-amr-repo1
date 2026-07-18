@@ -103,12 +103,16 @@ class RobotFSM(TravelMixin, WorkMixin, AmclInitMixin, Node):
         self._param_cli = self.create_client(
             SetParameters, '/controller_server/set_parameters')
 
-        # ── 도킹 (aruco_docking dock_controller) ──────────────
-        self._work_dock_cli = self.create_client(Trigger, '/start_work_dock')   # 작업(전진)
+        # ── 도킹 (aruco_docking dock_controller — work는 staging 방식 통합 2026-07-17) ──
+        #   work(전진)=STAGE_GOTO→APPROACH(마커 위치 m_y 조향, 법선 오프셋 무관) / home·undock=기존.
+        self._work_dock_cli = self.create_client(Trigger, '/start_work_dock')   # 작업(전진, staging)
         self._home_dock_cli = self.create_client(Trigger, '/start_home_dock')   # 홈(후진 180°+안착)
         self._undock_cli = self.create_client(Trigger, '/start_undock')
         self._estimator_param_cli = self.create_client(
             SetParameters, '/aruco_estimator/set_parameters')
+        # work 도킹 직전 도크별 lateral 목표(target_marker_y) 주입용
+        self._work_param_cli = self.create_client(
+            SetParameters, '/dock_controller/set_parameters')
 
         # ── 포크 (ESP32 micro-ROS) — 절대 높이만 발행, cur_step 추적은 ESP32 ──
         #   ★ /fork_state는 best_effort 필수: micro-ROS(rclc) 발행자를 reliable 구독자가

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Smart Mart dock_controller — 마커(ArUco) 정밀 도킹 컨트롤러 (work 전진 / home 후진).
 
-구성 (전부 구현·실물 검증 — 상세 docs_hub/context/13 §7~8):
-  PREALIGN (수직 측면 재배치) → SERVO (PBVS 폐루프 접근) → ALIGN (제자리 yaw 정렬)
-  → [work] CREEP (odom 전진 안착 + 정체감지) / [home] SPIN180 → 후진 안착.
+구성 (실물 검증 — 상세 docs_hub/context/13):
+  PREALIGN (수직 측면 재배치) 공통 → 분기:
+    [work 전진] STAGE_GOTO (법선 위 점 go-to) → APPROACH (마커 위치 m_y 조향, 법선 무관)
+                → CREEP (odom 전진 안착).   ← staging 방식 (2026-07-17 통합, ALIGN 없음)
+    [home 후진] SERVO (법선 PBVS 폐루프) → ALIGN (제자리 yaw) → SPIN180 → 후진 안착.
   UNDOCK = odom 후진 고정거리 (포크 작업 후 이탈). 오차 로깅만 = `log_only:=true`.
+
+★ work가 SERVO(법선 coupled)에서 staging으로 바뀐 이유: 조향을 법선(e_y)에서 유도하면
+  도크별 법선오차(~1-2°)가 depth 레버암을 타고 e_y로 증폭(실측 ±8mm). m_y(위치)는 법선을
+  안 타 도크별 트림 0. home은 후진·주차라 정밀 비필요 → 기존 SERVO 유지. 상세 context/13 §10.
 
 제어법칙 (부호·게인 실물 확정 2026-07-08 — 상세 docs_hub/context/13):
   SERVO: ω = −k_y·e_y + k_θ·e_θ,  v = clamp(k_v·ρ, v_min, v_max)  (소프트 정렬게이트)
@@ -22,8 +28,9 @@ PREALIGN (enable_prealign=true, 기본): SERVO 앞단. 마커로 e_y 측정 → 
 
 오차(base_link, x=전방 y=좌): ρ=정지점(마커앞 stop_dist)까지 / e_y=cross-track /
   e_θ=마커정면까지 헤딩 / depth=마커까지. EMA 저역통과.
-상태: IDLE → PREALIGN → SERVO → ALIGN →[work] CREEP / [home] SPIN180 → UNDOCK(후진) → DONE
-       (실패: LOST / TIMEOUT / STALL / MISALIGNED)
+상태: IDLE → PREALIGN →[work] STAGE_GOTO → APPROACH → CREEP
+                      →[home] SERVO → ALIGN → SPIN180 → 후진안착 → DONE
+       UNDOCK(후진) 별도. (실패: LOST / TIMEOUT / STALL / MISALIGNED)
 트리거(std_srvs/Trigger, blocking→success): /start_work_dock(전진) · /start_home_dock(후진 180°+안착) ·
   /start_undock(포크 후 이탈). work·home은 `_run_dock(reverse)` 공유(모드=서비스로 명시, param 아님).
   입력: /detected_dock_pose+TF+/odom. 출력: /cmd_vel(TwistStamped).
@@ -94,7 +101,7 @@ class DockControllerNode(Node):
         #   측면 이동은 법선에 수직이라 depth(런웨이) 소모 0. 회전 odom오차는 SERVO가 폐루프로 청소.
         #   실패 시 enable_prealign:=false 로 즉시 옛 동작(바로 SERVO) 복귀.
         self.declare_parameter('enable_prealign', True)
-        self.declare_parameter('prealign_min_ey', 0.010)    # e_y 이 이내면 재배치 스킵(이미 축 위). 1cm=재배치 정밀바닥(odom회전2번+마커노이즈). 5mm 실험은 노이즈근처라 오히려 반대편行→원복
+        self.declare_parameter('prealign_min_ey', 0.010)    # e_y 이 이내면 재배치 스킵(이미 축 위). 1cm=재배치 오픈루프 정밀바닥(회전-직진-회전, odom회전2번+마커노이즈). 5mm 재시도(2026-07-18) 폐기: PREALIGN 정밀도는 STAGE_GOTO+APPROACH(m_y)가 덮어써 결과 무영향 → 이득 없이 재배치 빈발·리밋사이클 리스크만 추가
         self.declare_parameter('prealign_max_ey', 0.10)     # 측면직진 거리 상한(안전 캡)
         self.declare_parameter('prealign_omega', 0.3)       # 90° 회전 각속도
         self.declare_parameter('prealign_v', 0.03)          # 측면 직진 속도
@@ -111,9 +118,32 @@ class DockControllerNode(Node):
         #   (구 버그: e_y<3mm AND e_θ<5° AND-게이트 → 못 만족 시 블러존까지 무한크롤→TIMEOUT, 개루프 미실행.)
         self.declare_parameter('handoff_depth', 0.18)     # 이 거리서 SERVO→ALIGN(블러존 0.16 진입 전)
         self.declare_parameter('handoff_max_ey', 0.02)    # 핸드오프 수용 e_y 상한(초과=MISALIGNED). 포크통합 전 전체사이클 테스트용 완화(0.012→0.02). 포크 붙일 땐 6mm로 조일 것
+
+        # ── work(전진) 도킹 = staging 방식 (2026-07-17 통합) ─────────────────
+        #   법선 SERVO(coupled) 폐기. PREALIGN→STAGE_GOTO(법선 위 점 go-to)→APPROACH(마커
+        #   위치 m_y 조향, 법선 무관)→CREEP. home/undock 은 아래 SERVO/SPIN180 그대로.
+        self.declare_parameter('stage_depth', 0.25)          # 마커 앞 법선 위 staging 거리 D
+        self.declare_parameter('stage_ang_tol_deg', 2.0)     # staging 지점 조준/정렬 허용각
+        self.declare_parameter('stage_dist_tol', 0.02)       # staging 지점 도달 허용거리
+        self.declare_parameter('stage_v', 0.03)              # go-to-pose 직진 속도
+        self.declare_parameter('stage_k', 0.8)               # bearing 조향 게인(과보정/진동 방지)
+        self.declare_parameter('stage_deadband_deg', 2.0)    # |bearing| 이내면 조향 0
+        self.declare_parameter('stage_freeze_range', 0.05)   # 점 근처면 조향 멈추고 직진(atan2 발산 방지)
+        self.declare_parameter('approach_speed', 0.02)       # APPROACH 직진 속도
+        self.declare_parameter('stage_handoff_depth', 0.20)  # work APPROACH 종료 depth(home handoff_depth와 분리)
+        self.declare_parameter('approach_k', 1.0)            # m_y bearing 조향 게인
+        self.declare_parameter('approach_deadband_deg', 1.5) # |bearing| 이내면 조향 0
+        # ★ 도크별 lateral 목표 = 마커의 base_link y 목표(m). 0=마커 정중앙. FSM이 도킹 직전 param set.
+        self.declare_parameter('target_marker_y', 0.0)
         # ★ 마커축 ↔ 포크슬롯 중심 계통 오프셋 보정 (실물서 포크가 슬롯 한쪽으로 치우치면 조정).
         #   e_y_target = 이 값. +면 로봇 좌(+y)로 치우쳐 정지. 부호는 실물서 밀리는 반대로.
         self.declare_parameter('target_lateral_offset', 0.0)
+
+        # ★ 도크별 마커 법선 오프셋 보정 (deg). 로봇을 슬롯에 물리적으로 직각·정중앙으로
+        #   세운 채 정지 관측한 e_θ 를 그대로 넣는다(= 추정 법선이 슬롯축에서 틀어진 각).
+        #   법선 (nx,ny) 를 −β 회전 → ρ·e_y·e_θ 가 전 depth에서 일관되게 슬롯축 기준이 됨.
+        #   0 = 보정 없음(기존 동작). 실측 예: 창고 +2.0, 입고 +0.75.
+        self.declare_parameter('marker_yaw_offset_deg', 0.0)
 
         # ── ALIGN (핸드오프 후 제자리 yaw 정렬 → CREEP 직진) ──────
         #   e_y(cross-track)는 제자리 회전에 불변 → e_θ만 0으로 조여 정면 확보.
@@ -182,7 +212,20 @@ class DockControllerNode(Node):
         self.prealign_ang_tol = math.radians(float(g('prealign_ang_tol_deg').value))
         self.handoff_depth = float(g('handoff_depth').value)
         self.handoff_max_ey = float(g('handoff_max_ey').value)
+        # work staging 파라미터 캐시
+        self.stage_depth = float(g('stage_depth').value)
+        self.stage_ang_tol = math.radians(float(g('stage_ang_tol_deg').value))
+        self.stage_dist_tol = float(g('stage_dist_tol').value)
+        self.stage_v = float(g('stage_v').value)
+        self.stage_k = float(g('stage_k').value)
+        self.stage_deadband = math.radians(float(g('stage_deadband_deg').value))
+        self.stage_freeze_range = float(g('stage_freeze_range').value)
+        self.approach_speed = float(g('approach_speed').value)
+        self.stage_handoff_depth = float(g('stage_handoff_depth').value)
+        self.approach_k = float(g('approach_k').value)
+        self.approach_deadband = math.radians(float(g('approach_deadband_deg').value))
         self.lat_offset = float(g('target_lateral_offset').value)
+        self.marker_yaw_off = math.radians(float(g('marker_yaw_offset_deg').value))
         self.k_align = float(g('k_align').value)
         self.align_done = math.radians(float(g('align_done_deg').value))
         self.align_timeout = float(g('align_timeout_sec').value)
@@ -210,7 +253,7 @@ class DockControllerNode(Node):
 
         # ── 상태 (락 보호) ────────────────────────────────────────
         self._lock = threading.Lock()
-        self._state = 'IDLE'          # IDLE/PREALIGN/SERVO/ALIGN/CREEP/SPIN180/UNDOCK/DONE/LOST/TIMEOUT/STALL/MISALIGNED
+        self._state = 'IDLE'          # IDLE/PREALIGN/[work]STAGE_GOTO/APPROACH/[home]SERVO/ALIGN/CREEP/SPIN180/UNDOCK/DONE/LOST/TIMEOUT/STALL/MISALIGNED
         self._align_t0 = None
         # PREALIGN 서브페이즈 상태 (control 스레드 단독 갱신)
         self._pa_phase = None         # FACE/TURN1/DRIVE/TURN2
@@ -220,10 +263,16 @@ class DockControllerNode(Node):
         self._pa_pos0 = None          # 측면직진 기준 odom pos
         self._reverse = False         # 홈 후진 도킹 플래그 (ALIGN 후 SPIN180→후진 안착)
         self._reverse_dist = 0.0      # 후진 안착 거리 (ALIGN서 마커 보며 캡처)
+        self._target_y = 0.0          # work 도크별 lateral 목표 (도킹 시작 시 param에서 캡처)
         self._ema_rho = None
         self._ema_ey = None
         self._ema_eth = None
         self._ema_depth = None
+        self._ema_mx = None           # work staging: 마커 위치/법선 EMA
+        self._ema_my = None
+        self._ema_nx = None
+        self._ema_ny = None
+        self._sg_phase = None         # STAGE_GOTO 서브페이즈: AIM/DRIVE/FACE
         self._last_pose_t = None
         self._start_t = None
         self._got_pose = False
@@ -249,7 +298,10 @@ class DockControllerNode(Node):
         self.get_logger().info(
             f"dock_controller [{mode}] up | base={self.base_frame} stop_dist={self.stop_dist}m "
             f"k=(v{self.k_v},y{self.k_y_far}~{self.k_y},θ{self.k_theta}) v_max={self.v_max} handoff_depth={self.handoff_depth} "
-            f"creep={self.creep_speed} max_creep={self.max_creep_dist} | ω=−k_y·e_y+k_θ·e_θ")
+            f"creep={self.creep_speed} max_creep={self.max_creep_dist} "
+            f"marker_yaw_off={math.degrees(self.marker_yaw_off):+.2f}° "
+            f"prealign_min_ey={self.prealign_min_ey} lat_off={self.lat_offset:+.4f}m "
+            f"| ω=−k_y·e_y+k_θ·e_θ")
 
     # ── EMA ────────────────────────────────────────────────────────
     def _ema(self, prev, new):
@@ -298,13 +350,20 @@ class DockControllerNode(Node):
         ext = self._extract_errors(pose_base)
         if ext is None:
             return
-        rho, e_y, e_theta, depth, _n = ext
+        rho, e_y, e_theta, depth, (nx, ny), (mx, my) = ext
 
         with self._lock:
             self._ema_rho = self._ema(self._ema_rho, rho)
             self._ema_ey = self._ema(self._ema_ey, e_y)
             self._ema_eth = self._ema_angle(self._ema_eth, e_theta)
             self._ema_depth = self._ema(self._ema_depth, depth)
+            # work staging EMA(마커 위치/법선)는 work 도킹(reverse=False)에서만 소비 →
+            #   home 도킹 중엔 갱신 생략. (work는 PREALIGN부터 갱신돼 STAGE_GOTO서 신선)
+            if not self._reverse:
+                self._ema_mx = self._ema(self._ema_mx, mx)
+                self._ema_my = self._ema(self._ema_my, my)
+                self._ema_nx = self._ema(self._ema_nx, nx)
+                self._ema_ny = self._ema(self._ema_ny, ny)
             self._last_pose_t = time.time()
             fr, fy, ft, st = self._ema_rho, self._ema_ey, self._ema_eth, self._state
 
@@ -327,20 +386,34 @@ class DockControllerNode(Node):
         nx, ny = nx / n, ny / n
         if nx * (-m_x) + ny * (-m_y) < 0.0:
             nx, ny = -nx, -ny
+        # ★ raw 법선(트림 미적용) — work STAGE_GOTO 전용 반환. work는 marker_yaw_off/lat_offset
+        #   (home 법선 기반 트림)에 오염되면 안 됨(staging 설계 = 트림 불필요, context/13 §10).
+        nx_raw, ny_raw = nx, ny
+
+        # 도크별 마커 오프셋 보정(home 전용): 법선을 −β 회전 → 아래 ρ·e_y·e_θ 가 슬롯축 기준.
+        #   work는 위 raw 법선을 쓰므로 이 회전에 영향 안 받음.
+        if self.marker_yaw_off != 0.0:
+            c, s = math.cos(-self.marker_yaw_off), math.sin(-self.marker_yaw_off)
+            nx, ny = c * nx - s * ny, s * nx + c * ny
 
         sx = m_x + self.stop_dist * nx
         sy = m_y + self.stop_dist * ny
         rho = math.hypot(sx, sy)
-        # cross-track(부호) − 슬롯중심 계통 오프셋 보정 → 목표를 '슬롯축' 위로
+        # cross-track(부호) − 슬롯중심 계통 오프셋 보정 → 목표를 '슬롯축' 위로 (home SERVO/PREALIGN용)
         e_y = (m_y * nx - m_x * ny) - self.lat_offset
         e_theta = _norm(math.atan2(-ny, -nx))
-        return rho, e_y, e_theta, depth, (nx, ny)
+        # 반환 (nx,ny)=raw(work EMA 소비) / e_y·e_θ·ρ=트림 적용(home 소비)
+        return rho, e_y, e_theta, depth, (nx_raw, ny_raw), (m_x, m_y)
 
     def control_step(self):
         with self._lock:
             state = self._state
         if state == 'PREALIGN':
             self._prealign_step()
+        elif state == 'STAGE_GOTO':
+            self._stage_goto_step()
+        elif state == 'APPROACH':
+            self._approach_step()
         elif state == 'SERVO':
             self._servo_step()
         elif state == 'ALIGN':
@@ -393,8 +466,10 @@ class DockControllerNode(Node):
                 return
             # 정면 확보 → 이미 축 위(min_ey 이내)면 재배치 스킵하고 SERVO 직행, 아니면 e_y 캡처 후 측면 재배치.
             if abs(ey) < self.prealign_min_ey:
-                self.get_logger().info(f"PREALIGN 종료 (e_y={ey:+.4f}, 축 위) → SERVO")
-                self._enter_servo()
+                self.get_logger().info(
+                    f"PREALIGN 종료 (e_y={ey:+.4f}, 축 위) → "
+                    f"{'SERVO' if self._reverse else 'STAGE_GOTO'}")
+                self._enter_after_prealign()
                 return
             eyt = _clamp(abs(ey), 0.0, self.prealign_max_ey)
             direction = 1.0 if ey < 0.0 else -1.0   # e_y<0=로봇 축 오른쪽 → 좌(+y,CCW)로 이동
@@ -448,8 +523,10 @@ class DockControllerNode(Node):
             turned = _norm(odom[2] - self._pa_yaw0)
             if turned * (-self._pa_dir) >= (math.pi / 2 - self.prealign_ang_tol):
                 self._stop()
-                self.get_logger().info("PREALIGN TURN2(−90°) 완료 → SERVO")
-                self._enter_servo()   # EMA 리셋 + 재획득 유예 처리
+                self.get_logger().info(
+                    "PREALIGN TURN2(−90°) 완료 → "
+                    f"{'SERVO' if self._reverse else 'STAGE_GOTO'}")
+                self._enter_after_prealign()
                 return
             self._publish(0.0, -self._pa_dir * self.prealign_omega)
             return
@@ -666,7 +743,7 @@ class DockControllerNode(Node):
 
     # ── 트리거 서비스 ──────────────────────────────────────────────
     #   work(전진)·home(후진) 공용 `_run_dock(reverse)`. 서비스는 얇은 래퍼(모드 명시 — 모드를
-    #   param 상태로 나르지 않음). 전진/후진 분기는 상태머신 ALIGN에서 갈림(_reverse 플래그).
+    #   param 상태로 나르지 않음). work=PREALIGN→STAGE_GOTO(staging) / home=PREALIGN→SERVO(_reverse).
     def on_start_work_dock(self, request, response):
         return self._run_dock(False, response)
 
@@ -688,15 +765,23 @@ class DockControllerNode(Node):
                 return response
             self._reverse = reverse
             self._ema_rho = self._ema_ey = self._ema_eth = self._ema_depth = None
+            # work staging EMA도 리셋 — 직전 도크의 stale 법선/위치가 첫 STAGE_GOTO 지점에 새는 것 방지.
+            self._ema_mx = self._ema_my = self._ema_nx = self._ema_ny = None
+            # 도크별 lateral 목표는 도킹 시작 시 1회 캡처(FSM이 서비스 호출 직전 param set).
+            #   파라미터 콜백 부재(§8.6) 우회 — APPROACH 핫루프서 매 틱 get_parameter 안 함.
+            self._target_y = float(self.get_parameter('target_marker_y').value)
             self._start_t = time.time()
             if self.enable_prealign:
                 self._pa_phase = 'FACE'
                 self._state = 'PREALIGN'
+            elif reverse:
+                self._state = 'SERVO'          # home: 법선 SERVO
             else:
-                self._state = 'SERVO'
-        kind = 'HOME(후진)' if reverse else 'WORK(전진)'
-        self.get_logger().info(
-            f"{kind} 도킹 시작 ({'PREALIGN' if self.enable_prealign else 'SERVO'})")
+                self._sg_phase = 'AIM'          # work: staging
+                self._state = 'STAGE_GOTO'
+        kind = 'HOME(후진)' if reverse else 'WORK(전진/staging)'
+        entry = 'PREALIGN' if self.enable_prealign else ('SERVO' if reverse else 'STAGE_GOTO')
+        self.get_logger().info(f"{kind} 도킹 시작 ({entry})")
 
         while rclpy.ok():
             with self._lock:
@@ -760,6 +845,137 @@ class DockControllerNode(Node):
         response.message = st
         self.get_logger().info(f"언도킹 종료: {st} (success={response.success})")
         return response
+
+    # ══ work(전진) staging 경로 (2026-07-17 통합) ═══════════════════════════
+    #   PREALIGN 종료 → STAGE_GOTO(법선 위 점 go-to) → APPROACH(m_y 조향) → CREEP.
+    #   home(reverse)은 _enter_servo 로 빠져 기존 법선 SERVO 유지.
+    def _enter_after_prealign(self):
+        if self._reverse:
+            self._enter_servo()          # home: EMA 리셋 + SERVO
+        else:
+            self._enter_stage_goto()     # work: EMA 유지 + STAGE_GOTO
+
+    def _timed_out(self, now):
+        return self._start_t is not None and (now - self._start_t) > self.dock_timeout
+
+    def _marker_lost(self, now, last_t):
+        return last_t is None or (now - last_t) > self.marker_timeout
+
+    def _fail(self, state, reason):
+        self._stop()
+        self._set_state(state)
+        self.get_logger().warn(f"{reason} → 정지 · {state}")
+
+    def _enter_stage_goto(self):
+        now = time.time()
+        with self._lock:
+            self._last_pose_t = now      # 마커 재검출 유예(PREALIGN 회전 후 EMA 신선화)
+            self._sg_phase = 'AIM'
+            self._state = 'STAGE_GOTO'
+        self.get_logger().info(f"→ STAGE_GOTO (법선 위 {self.stage_depth}m 지점)")
+
+    def _stage_point(self):
+        """staging 지점(base_link) = 마커 + D·법선. 필터값 없으면 None."""
+        with self._lock:
+            mx, my = self._ema_mx, self._ema_my
+            nx, ny = self._ema_nx, self._ema_ny
+        if mx is None or nx is None:
+            return None
+        return mx + self.stage_depth * nx, my + self.stage_depth * ny
+
+    def _stage_goto_step(self):
+        with self._lock:
+            phase = self._sg_phase
+            eth, last_t, odom = self._ema_eth, self._last_pose_t, self._odom
+        now = time.time()
+        if self._timed_out(now):
+            self._fail('TIMEOUT', 'STAGE_GOTO 타임아웃')
+            return
+        if self._marker_lost(now, last_t):
+            self._fail('LOST', '마커 소실(STAGE_GOTO)')
+            return
+        if odom is None:
+            return
+        sp = self._stage_point()
+        if sp is None:
+            return
+        sx, sy = sp
+        rng = math.hypot(sx, sy)
+        bearing = math.atan2(sy, sx)
+
+        if phase == 'AIM':
+            if abs(bearing) < self.stage_ang_tol or rng < self.stage_freeze_range:
+                with self._lock:
+                    self._sg_phase = 'DRIVE'
+                self._stop()
+                return
+            self._publish(0.0, _clamp(self.stage_k * bearing, -self.omega_max, self.omega_max))
+            return
+
+        if phase == 'DRIVE':
+            if rng < self.stage_dist_tol:
+                with self._lock:
+                    self._sg_phase = 'FACE'
+                self._stop()
+                self.get_logger().info(f"STAGE_GOTO 지점 도달(잔여 {rng*100:.1f}cm) → 마커 yaw 정렬")
+                return
+            if rng < self.stage_freeze_range or abs(bearing) < self.stage_deadband:
+                omega = 0.0
+            else:
+                omega = _clamp(self.stage_k * bearing, -self.omega_max, self.omega_max)
+            self._publish(self.stage_v, omega)
+            return
+
+        if phase == 'FACE':
+            if eth is None:
+                return
+            if abs(eth) < self.align_done:
+                self._stop()
+                self.get_logger().info(
+                    f"STAGE_GOTO yaw 정렬 완료(e_θ={math.degrees(eth):+.1f}°) → APPROACH")
+                with self._lock:
+                    self._state = 'APPROACH'
+                return
+            self._publish(0.0, _clamp(self.k_align * eth, -self.omega_max, self.omega_max))
+            return
+
+    def _approach_step(self):
+        with self._lock:
+            mx, my = self._ema_mx, self._ema_my
+            depth, last_t = self._ema_depth, self._last_pose_t
+        now = time.time()
+        if self._timed_out(now):
+            self._fail('TIMEOUT', 'APPROACH 타임아웃')
+            return
+        if self._marker_lost(now, last_t):
+            self._fail('LOST', '마커 소실(APPROACH)')
+            return
+        if depth is None or mx is None:
+            return
+        tgt_y = self._target_y   # 도킹 시작 시 캡처(핫루프서 param 조회 안 함)
+        if depth <= self.stage_handoff_depth:
+            lat_err = my - tgt_y
+            if abs(lat_err) > self.handoff_max_ey:
+                self._fail('MISALIGNED',
+                           f'마커 lateral err={lat_err:+.4f} > {self.handoff_max_ey:.3f} '
+                           f'(m_y={my:+.4f}, 목표={tgt_y:+.4f})')
+                return
+            # ALIGN 폐지(2026-07-17): m_y는 이미 예산 안. e_θ 제자리회전은 편향 법선을 지우려다
+            #   회전 레버암으로 그 좋은 m_y를 되레 민다(m_y는 회전 불변 아님). → 바로 CREEP.
+            with self._lock:
+                odom = self._odom
+            if odom is None:
+                return
+            self.get_logger().info(
+                f"핸드오프 (depth={depth:.3f}, m_y={my:+.4f}, 목표={tgt_y:+.4f}, e_θ 보정 안 함) → CREEP")
+            self._enter_creep(depth, odom)
+            return
+        bearing = math.atan2(my - tgt_y, mx)
+        if abs(bearing) < self.approach_deadband:
+            omega = 0.0
+        else:
+            omega = _clamp(self.approach_k * bearing, -self.omega_max, self.omega_max)
+        self._publish(self.approach_speed, omega)
 
     def _publish(self, v, omega):
         m = TwistStamped()
