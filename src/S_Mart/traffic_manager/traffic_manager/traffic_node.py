@@ -43,8 +43,17 @@ class TrafficNode(Node):
         # 장애물 차단 해제 — 테스트/정비용 수동 훅 (나중에 관제 GUI가 이 토픽 발행).
         #   {"node":"N9"} 특정 노드 해제 / {"all":true} 전체 해제
         self.create_subscription(String, '/traffic/unblock', self._on_unblock, 10)
+        # 관제 GUI 장애물 알람 — block/clear 발행 (GUI가 구독·렌더·제거버튼 제공).
+        #   block: {"event":"block","kind":"reroute|goal_blocked|no_route","node":,"robot":}
+        #   clear: {"event":"clear","node":}
+        self._obstacle_pub = self.create_publisher(String, '/traffic/obstacle', 10)
+        self._announced = {}          # node -> kind : GUI에 알린 차단 상태 미러
         self.create_timer(0.5, self._on_timer)
         self.get_logger().info('Traffic Manager 노드 시작 (토픽 인터페이스)')
+
+    def _emit_obstacle(self, event, node, kind='', robot=''):
+        self._obstacle_pub.publish(String(data=json.dumps(
+            {'event': event, 'node': node, 'kind': kind, 'robot': robot})))
 
     def _on_unblock(self, msg):
         try:
@@ -108,16 +117,19 @@ class TrafficNode(Node):
             # 로봇이 recovery로 지속 장애물 확정 → 노드 전역 차단 + 대응 결정
             kind, node, route = self.tm.report_obstacle(robot)
             if node is not None:
+                # 처음 알리는 노드면 GUI에 block 발행 (report_obstacle은 kind 무관하게
+                # block_node로 노드를 차단하므로 3종 다 발행). clear는 _on_timer reconcile.
+                if node not in self._announced:
+                    self._announced[node] = kind
+                    self._emit_obstacle('block', node, kind, robot)
                 if kind == 'goal_blocked':
                     self.get_logger().warn(
                         f'⚠️ {robot} 목적지 노드 막힘 ({node}) — 대기. '
                         f'사람이 치우고 통과하면 자동해제(or /traffic/unblock)')
-                    # TODO(GUI): pg_notify('obstacle_detected', {kind:goal_blocked, node}) — 긴급(로봇 정지)
                 else:
                     self.get_logger().warn(
                         f'⚠️ {robot} 장애물 노드 차단 {node} ({kind}). '
                         f'사람이 치우면 통과 시 자동해제(or /traffic/unblock)')
-                    # TODO(GUI): pg_notify('obstacle_detected', {kind, node}) — 우회 중
             if kind == 'reroute':
                 self._send(robot, {'type': 'reroute', 'route': route})
                 self.get_logger().info(f'{robot} 우회: {"→".join(route)}')
@@ -153,6 +165,14 @@ class TrafficNode(Node):
             self._send(robot, {'type': 'wait'})
 
     def _on_timer(self):
+        # 차단 해제 reconcile — 미러(_announced) vs 실제 차단집합 비교해 사라진 노드는
+        # GUI에 clear 발행. 자동 자가치유(통과)·GUI 제거버튼·전체해제 3경로를 한 곳에서 커버.
+        blocked = self.tm.blocked_nodes()
+        for node in list(self._announced):
+            if node not in blocked:
+                self._emit_obstacle('clear', node)
+                del self._announced[node]
+
         actions = self.tm.resolve_deadlock()
         for robot, act in actions.items():
             if act == 'reroute':
