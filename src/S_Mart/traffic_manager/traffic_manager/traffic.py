@@ -85,6 +85,10 @@ class TrafficManager:
         """전체 차단 해제."""
         self._blocked_nodes.clear()
 
+    def blocked_nodes(self):
+        """현재 차단된 노드 집합 (GUI 상태 동기화용 — traffic_node reconcile)."""
+        return set(self._blocked_nodes)
+
     def _node_blocked(self, n):
         return n in self._blocked_nodes
 
