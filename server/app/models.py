@@ -102,7 +102,9 @@ class Task(Base):
 class Location(Base):
     __tablename__ = "locations"
 
-    location_id  = Column(String, primary_key=True)             # ex) SLOT-A1
+    # robot_fsm/config/locations.yaml 의 key 와 반드시 일치 — 로봇이 이 값으로
+    # 노드/층/도킹 마커를 찾는다. ex) A1-L1 (A1 랙 하층)
+    location_id  = Column(String, primary_key=True)
     storage_type = Column(Enum(StorageType), nullable=False)
     product_name = Column(String, ForeignKey("products.name"), nullable=True)
     inbound_at   = Column(TIMESTAMP(timezone=True), nullable=True)
