@@ -47,6 +47,9 @@ class RosLink(QObject):
     battery_changed = pyqtSignal(str, float)       # robot, 0.0~1.0
     pose_changed = pyqtSignal(str, float, float)   # robot, x, y
     detection = pyqtSignal(str, str)               # 토픽 종류, 사람이 읽을 요약
+    # 장애물 노드 차단/해제. event='block'|'clear', node, kind='reroute'|'goal_blocked'|
+    # 'no_route'|'' (clear는 kind/robot 빈 문자열).
+    obstacle_changed = pyqtSignal(str, str, str, str)   # event, node, kind, robot
 
     def __init__(self):
         super().__init__()
@@ -79,8 +82,14 @@ class RosLink(QObject):
             String, '/detection/cleared',
             lambda m: self._on_detection('cleared', m), 10)
 
+        # 장애물 차단/해제 이벤트 (traffic_node가 발행) — 알람·맵 오버레이 소스
+        self._node.create_subscription(
+            String, '/traffic/obstacle', self._on_obstacle, 10)
+
         # 관제 개입: 오배송 회수 위임 (task_manager가 구독)
         self._reclaim_pub = self._node.create_publisher(String, '/reclaim_request', 10)
+        # 장애물 노드 차단 해제 (제거 버튼 → traffic_node가 구독)
+        self._unblock_pub = self._node.create_publisher(String, '/traffic/unblock', 10)
 
         self._exec = MultiThreadedExecutor()
         self._exec.add_node(self._node)
@@ -119,6 +128,20 @@ class RosLink(QObject):
             return
         self.detection.emit(kind, d.get('product_name') or d.get('slot') or msg.data)
 
+    def _on_obstacle(self, msg: String):
+        """traffic_node 장애물 이벤트.
+          block: {"event":"block","kind":"reroute|goal_blocked|no_route","node":"N9","robot":"AMR_1"}
+          clear: {"event":"clear","node":"N9"}
+        """
+        try:
+            d = json.loads(msg.data)
+            event, node = d['event'], d['node']
+        except (json.JSONDecodeError, KeyError, TypeError):
+            self._node.get_logger().warn(f'/traffic/obstacle 파싱 실패: {msg.data!r}')
+            return
+        self.obstacle_changed.emit(
+            event, node, d.get('kind') or '', d.get('robot') or '')
+
     # ── GUI 스레드에서 호출 ───────────────────────────────────
 
     def is_stale(self, robot: str) -> bool:
@@ -135,6 +158,15 @@ class RosLink(QObject):
         """
         self._reclaim_pub.publish(String(data=json.dumps({'order_id': order_id})))
         self._node.get_logger().info(f'/reclaim_request 발행: order_id={order_id}')
+
+    def publish_unblock(self, node: str):
+        """제거 버튼 → 장애물 노드 차단 해제. traffic_node가 unblock_node 호출.
+
+        해제 성공은 traffic_node가 되쏘는 /traffic/obstacle {event:clear}로 확인한다
+        (여기서 낙관적으로 지우지 않음 — 메시지 유실 시 UI가 거짓 정상화를 보이지 않게).
+        """
+        self._unblock_pub.publish(String(data=json.dumps({'node': node})))
+        self._node.get_logger().info(f'/traffic/unblock 발행: node={node}')
 
     def shutdown(self):
         self._exec.shutdown()

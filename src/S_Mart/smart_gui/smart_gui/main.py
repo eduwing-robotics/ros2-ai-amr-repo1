@@ -27,7 +27,7 @@ from .map_view import MapView
 from .ops_page import OpsPage
 from .panels import (
     ORDER_STATUS_STYLE, TASK_TYPE_STYLE, KpiTile, Panel, RobotCard, make_alert,
-    make_empty, make_row,
+    make_empty, make_obstacle_alert, make_row,
 )
 from .ros_link import ROBOT_IDS, RosLink
 from .vision_page import VisionPage
@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         self._status = {r: None for r in ROBOT_IDS}     # ROS 수신 원본
         self._battery = {r: None for r in ROBOT_IDS}
         self._queue_len = 0
+        self._obstacles = {}     # node → {'kind':..., 'robot':...}  traffic 차단 상태
         # 1초마다 도는 패널은 내용이 바뀔 때만 다시 그린다 (깜빡임·CPU 낭비 방지)
         self._sig = {}
 
@@ -123,6 +124,7 @@ class MainWindow(QMainWindow):
         ros.status_changed.connect(self._on_status)
         ros.battery_changed.connect(self._on_battery)
         ros.pose_changed.connect(self._on_pose)
+        ros.obstacle_changed.connect(self._on_obstacle)
         db.notified.connect(self._on_notify)
         db.error.connect(self._on_db_error)
 
@@ -319,6 +321,19 @@ class MainWindow(QMainWindow):
 
     def _on_pose(self, robot: str, x: float, y: float):
         self.map.set_pose(robot, x, y)
+
+    def _on_obstacle(self, event: str, node: str, kind: str, robot: str):
+        """traffic 장애물 차단/해제 이벤트 → 맵 오버레이 + 알림 즉시 갱신."""
+        if event == 'block':
+            self._obstacles[node] = {'kind': kind, 'robot': robot}
+        elif event == 'clear':
+            self._obstacles.pop(node, None)
+        self.map.set_dynamic_blocks({n: o['kind'] for n, o in self._obstacles.items()})
+        self._refresh_alerts()
+
+    def _clear_obstacle(self, node: str):
+        """제거 버튼 → /traffic/unblock 발행. 실제 해제 표시는 traffic의 clear 이벤트로."""
+        self.ros.publish_unblock(node)
 
     def _on_notify(self, channel: str):
         if channel in ('new_order', 'order_status_updated', 'order_cancelled'):
@@ -517,13 +532,34 @@ class MainWindow(QMainWindow):
                                f'{o["product_name"]} · 주문 생성 {_fmt_age(o["age_sec"] or 0)}',
                                theme.AMBER))
 
-        if not self._changed('alerts', alerts):
+        # 장애물 차단 알람(맵과 같은 상태에서 파생). 위젯에 버튼이 붙어 tuple로 못 담으므로
+        # 별도 렌더하되, 변경 감지 시그니처에는 포함해 차단/해제 시 패널이 다시 그려지게 한다.
+        ob_sig = tuple(sorted(
+            (n, o['kind'], o['robot']) for n, o in self._obstacles.items()))
+        if not self._changed('alerts', (tuple(alerts), ob_sig)):
             return
         self.alert_panel.clear_body()
-        self.alert_panel.set_cnt(f'{len(alerts)}건')
-        if not alerts:
+        self.alert_panel.set_cnt(f'{len(alerts) + len(self._obstacles)}건')
+        if not alerts and not self._obstacles:
             self.alert_panel.body.addWidget(make_empty('알림 없음'))
             return
+
+        # 장애물(로봇 정지 위험)을 맨 위에. reroute=우회+[제거], goal_blocked/no_route=대기·자동해제.
+        OB_STYLE = {
+            'reroute':      ('🚧', '경유 노드 막힘', '우회 중 · 장애물 치운 뒤 [제거] 클릭', theme.ORANGE),
+            'goal_blocked': ('⛔', '목적지 노드 막힘', '대기 중 · 장애물 제거 시 통과하면 자동 해제', theme.RED),
+            'no_route':     ('⛔', '우회로 없음', '대기 중 · 장애물 제거 시 통과하면 자동 해제', theme.RED),
+        }
+        for node, o in self._obstacles.items():
+            icon, title, detail, color = OB_STYLE.get(
+                o['kind'], ('⛔', '노드 차단', '대기 중', theme.RED))
+            robot = o['robot'] or '로봇'
+            # 일반(reroute)만 수동 제거 — 우회한 로봇이 그 노드를 안 지나 자동해제가 안 되기 때문.
+            on_clear = (lambda _c=False, n=node: self._clear_obstacle(n)) \
+                if o['kind'] == 'reroute' else None
+            self.alert_panel.body.addWidget(make_obstacle_alert(
+                icon, f'{title} · {node}', f'{robot} · {detail}', color, on_clear))
+
         for icon, title, detail, color in alerts:
             self.alert_panel.body.addWidget(make_alert(icon, title, detail, color))
 
