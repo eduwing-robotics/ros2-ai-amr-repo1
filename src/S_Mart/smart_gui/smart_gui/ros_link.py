@@ -28,6 +28,18 @@ ROBOT_IDS = ['AMR_1', 'AMR_2']
 STALE_SEC = 3.0
 
 
+def _norm_battery(pct: float) -> float:
+    """BatteryState.percentage를 0.0~1.0으로 정규화.
+
+    sensor_msgs/BatteryState 스펙은 percentage = 0.0~1.0인데
+    **turtlebot3_node는 0~100으로 발행한다**(실측 2026-07-17: voltage 12.0에 percentage 83.33).
+    발행자를 우리가 못 고치므로 수신 측에서 정규화한다.
+    ※ 같은 이유로 fleet_manager의 배터리 가드(`percentage < 0.3`)도 무력 상태 — 별도 수정 필요.
+    """
+    pct = float(pct)
+    return pct / 100.0 if pct > 1.0 else pct
+
+
 class RosLink(QObject):
     """rclpy 노드 + 실행 스레드. 수신값은 시그널로만 GUI에 전달."""
 
@@ -89,7 +101,7 @@ class RosLink(QObject):
         self.status_changed.emit(robot, msg.data)
 
     def _on_battery(self, robot: str, msg: BatteryState):
-        self.battery_changed.emit(robot, float(msg.percentage))
+        self.battery_changed.emit(robot, _norm_battery(msg.percentage))
 
     def _on_pose(self, msg: String):
         try:

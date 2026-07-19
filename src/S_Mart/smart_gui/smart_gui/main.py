@@ -112,6 +112,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.vision)                    # index 1
         self.ops = OpsPage(ros, db)
         self.stack.addWidget(self.ops)                       # index 2
+        # 시작 페이지를 명시적으로 못박는다. Qt의 "첫 위젯이 current" 기본동작에 기대면
+        # 자식 위젯의 show 타이밍에 따라 다른 페이지가 current가 될 수 있고, 그러면
+        # 비전 페이지가 떠서 **기동하자마자 카메라를 구독**한다(= lazy 구독 설계 무력화).
+        self.stack.setCurrentIndex(0)
         shell.addWidget(self.stack, 1)
         lay.addLayout(shell, 1)
 

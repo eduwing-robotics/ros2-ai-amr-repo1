@@ -149,8 +149,11 @@ class VisionPage(QWidget):
         top.setSpacing(14)
         self.robot_tiles = {r: CameraTile(r) for r in ROBOT_CAMS}
         for r, tile in self.robot_tiles.items():
-            tile.setVisible(r == self.robot)
+            # 레이아웃에 넣어 부모를 붙인 **뒤에** 가시성을 정한다. 부모 없는 위젯에
+            # setVisible(True)를 하면 잠깐 최상위 창이 되고, 그 상태로 reparent되면
+            # 스택이 이 페이지를 current로 올려버린다.
             top.addWidget(tile, 1)
+            tile.setVisible(r == self.robot)
         top.addWidget(self._build_side(), 0)
         lay.addLayout(top, 3)
 
