@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>smart_bringup</name>
+  <version>0.1.0</version>
+  <description>S-Mart 통합 런치 모음 — 기기·도메인 단위로 노드를 한 번에 기동
+    (server: 데탑 도메인12 / robot: 로봇 Pi / docking: 데탑 로봇도메인).</description>
+  <maintainer email="difj3839@gmail.com">gustn</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 런치가 참조하는 패키지 (실행 시점 의존 — 런치는 컴파일 안 함) -->
+  <exec_depend>traffic_manager</exec_depend>
+  <exec_depend>fleet_manager</exec_depend>
+  <exec_depend>task_manager</exec_depend>
+  <exec_depend>smart_domain_bridge</exec_depend>
+  <exec_depend>ai_detector</exec_depend>
+  <exec_depend>smart_robot_bringup</exec_depend>
+  <exec_depend>smart_nav_bringup</exec_depend>
+  <exec_depend>robot_fsm</exec_depend>
+  <exec_depend>aruco_docking</exec_depend>
+  <exec_depend>human_detector</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
