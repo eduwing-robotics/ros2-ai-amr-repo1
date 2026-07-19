@@ -635,6 +635,12 @@ class TaskManagerNode(Node):
                 'UPDATE locations SET reserved_by = %s WHERE location_id = %s',
                 (task_id, source_loc)
             )
+            # 예약으로 available 재고가 줄었다 → 모든 고객 UI 실시간 갱신
+            # (order_status_updated는 주문목록만 갱신, 재고는 location_updated로만 재조회됨)
+            cur.execute(
+                'SELECT pg_notify(%s, %s)',
+                ('location_updated', json.dumps({'location_id': source_loc}))
+            )
 
             cur.execute(
                 'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
