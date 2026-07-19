@@ -31,6 +31,21 @@ _DSN = 'dbname=s_mart user=codelab password=codelab host=localhost'
 # 배터리 30% 미만이면 배정 제외
 BATTERY_MIN = 0.3
 
+
+def _norm_battery(pct: float) -> float:
+    """BatteryState.percentage를 0.0~1.0으로 정규화.
+
+    sensor_msgs/BatteryState 스펙은 `percentage = 0 to 1 range`인데
+    **turtlebot3_node는 0~100으로 발행한다** (실측 2026-07-17: voltage 11.76 / percentage 70.0).
+    스펙을 그대로 믿고 `percentage < 0.3`으로 비교하면 70.0 < 0.3 = 항상 False가 되어
+    **배터리 가드가 조용히 무력화**된다(방전된 로봇에도 임무가 배정됨).
+
+    발행자(3rd party 드라이버)를 고칠 수 없으므로 수신 측에서 방어적으로 정규화한다.
+    스케일이 둘 중 뭐든 안전하도록 값으로 판별한다 — 나중에 스펙을 지키는 드라이버나
+    시뮬로 바꿔도 그대로 동작(그래서 BATTERY_MIN을 30.0으로 바꾸는 방식은 채택 안 함).
+    """
+    return pct / 100.0 if pct > 1.0 else pct
+
 # 관리 로봇 목록 (ROS2 토픽명 규칙: 영문자·숫자·'_'만 허용 → 하이픈 대신 언더스코어)
 ROBOT_IDS = ['AMR_1', 'AMR_2']
 
@@ -105,13 +120,14 @@ class FleetManagerNode(Node):
     def _on_battery_state(self, robot_id: str, msg: BatteryState):
         """로봇이 /{robot_id}/battery_state 에 배터리 상태를 발행할 때 호출.
 
-        msg.percentage: 0.0(0%) ~ 1.0(100%).
+        수신 즉시 0.0~1.0으로 정규화해 저장 — 아래 로직과 _try_assign은 0~1만 다룬다.
         저장만 하고 직접 배정을 트리거하지 않음 — _try_assign 호출 시 참조.
         """
-        self._battery_status[robot_id] = msg.percentage
-        if msg.percentage < BATTERY_MIN:
+        pct = _norm_battery(msg.percentage)
+        self._battery_status[robot_id] = pct
+        if pct < BATTERY_MIN:
             self.get_logger().warn(
-                f'{robot_id} 배터리 부족: {msg.percentage * 100:.0f}%'
+                f'{robot_id} 배터리 부족: {pct * 100:.0f}%'
                 f' (최소 {BATTERY_MIN * 100:.0f}%)'
             )
 
