@@ -5,6 +5,9 @@ log/
 docs_hub/
 CLAUDE.md
 
+# Claude Code local settings (권한 허가 기록 — 머신별 로컬, 추적 안 함)
+.claude/
+
 # External ROS2 packages (managed via ros2_ai_amr.repos + vcs)
 src/turtlebot3/
 src/turtlebot3_msgs/
