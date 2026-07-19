@@ -445,6 +445,12 @@ class FleetManagerNode(Node):
                 """,
                 (task_id, 'cancelled', robot_id, now)
             )
+            # 선반 예약이 풀려 available 재고가 늘었다 → 고객 UI 실시간 갱신
+            # (order_cancelled broadcast는 주문목록만 갱신, 재고는 location_updated로만 갱신됨)
+            cur.execute(
+                'SELECT pg_notify(%s, %s)',
+                ('location_updated', json.dumps({'location_id': slot}))
+            )
             self._db.commit()
             self._last_used[robot_id] = time.time()   # 로봇은 이제 자유 — LRU 갱신
             self.get_logger().info(

@@ -223,6 +223,11 @@ class TaskManagerNode(Node):
                     'INSERT INTO event_logs (task_id, event, occurred_at) VALUES (%s, %s, %s)',
                     (task_id, 'cancelled', now)
                 )
+                # 선반 예약이 풀려 available 재고가 늘었다 → 고객 UI 실시간 갱신
+                cur.execute(
+                    'SELECT pg_notify(%s, %s)',
+                    ('location_updated', json.dumps({'location_id': shelf}))
+                )
                 self._sub_db.commit()
                 self.get_logger().info(
                     f'취소(pending): order_id={order_id} task_id={task_id} cancelled, 선반 {shelf} 예약 해제')
