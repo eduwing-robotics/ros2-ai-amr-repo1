@@ -57,7 +57,13 @@ class CameraTile(QFrame):
         self.view = QLabel()
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setMinimumHeight(120 if compact else 260)
-        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # pixmap을 담은 QLabel은 minimumSizeHint를 그 pixmap 크기로 보고한다.
+        # 매 프레임 view.size()에 맞춰 스케일한 pixmap을 다시 넣으면 그 크기가 곧
+        # 라벨의 새 최소치가 돼(커질 수만 있고 못 줄어드는 ratchet) → 전방 타일이
+        # 프레임마다 커지며 stretch로 묶인 게이트 행 몫을 빼앗는다. Ignored 정책은
+        # 레이아웃이 이 라벨의 sizeHint를 무시하게 해 크기를 stretch로만 정하게 한다.
+        # (세로 최소치는 위 setMinimumHeight의 명시적 minimumSize로 유지된다.)
+        self.view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.view.setStyleSheet(
             f'background: #0a1120; border: 1px solid {theme.LINE}; border-radius: 8px;'
             f'color: {theme.DIM};')
