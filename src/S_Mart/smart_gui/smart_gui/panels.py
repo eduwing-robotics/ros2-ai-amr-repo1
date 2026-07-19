@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QPainter, QPen, QPolygonF
 from PyQt5.QtCore import QPointF
 from PyQt5.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -322,6 +322,43 @@ def make_alert(icon: str, title: str, detail: str, color: str) -> QWidget:
     texts.addWidget(t)
     texts.addWidget(d)
     lay.addLayout(texts, 1)
+    return row
+
+
+def make_obstacle_alert(icon: str, title: str, detail: str, color: str,
+                        on_clear=None) -> QWidget:
+    """장애물 차단 알림. on_clear가 있으면 [제거] 버튼(일반 노드 막힘=우회),
+    없으면 버튼 없이 자동 해제 안내(목적지 막힘·우회로 없음=대기)."""
+    row = QWidget()
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 6, 0, 6)
+    lay.setSpacing(9)
+
+    bar = QFrame()
+    bar.setFixedWidth(3)
+    bar.setStyleSheet(f'background: {color}; border-radius: 1px;')
+    lay.addWidget(bar)
+
+    lay.addWidget(QLabel(icon))
+
+    texts = QVBoxLayout()
+    texts.setSpacing(1)
+    t = QLabel(title)
+    t.setObjectName('RowMain')
+    t.setWordWrap(True)
+    d = QLabel(detail)
+    d.setObjectName('RowMeta')
+    d.setWordWrap(True)
+    texts.addWidget(t)
+    texts.addWidget(d)
+    lay.addLayout(texts, 1)
+
+    if on_clear is not None:
+        btn = QPushButton('제거')
+        btn.setObjectName('RBtn')
+        btn.clicked.connect(on_clear)
+        btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        lay.addWidget(btn)
     return row
 
 

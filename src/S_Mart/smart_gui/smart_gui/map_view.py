@@ -42,6 +42,7 @@ class MapView(QWidget):
         self._graph = Graph()
         self._poses = {}        # robot → (x, y)  map 프레임
         self._stale = set()     # 연결 끊긴 로봇 (흐리게)
+        self._dyn_blocks = {}   # 런타임 차단 노드 {node: kind} (nodes.yaml 정적 blocked와 별개)
 
         xs = [n['x'] for n in self._graph.nodes.values()]
         ys = [n['y'] for n in self._graph.nodes.values()]
@@ -59,6 +60,11 @@ class MapView(QWidget):
             self._stale.add(robot)
         else:
             self._stale.discard(robot)
+        self.update()
+
+    def set_dynamic_blocks(self, blocks: dict):
+        """traffic 런타임 차단 노드 {node: kind}. block/clear 이벤트로 갱신."""
+        self._dyn_blocks = dict(blocks)
         self.update()
 
     # ── 좌표 변환 ─────────────────────────────────────────────
@@ -81,6 +87,7 @@ class MapView(QWidget):
 
         self._draw_edges(p)
         self._draw_nodes(p)
+        self._draw_dyn_blocks(p)
         self._draw_robots(p)
         self._draw_legend(p)
 
@@ -133,6 +140,27 @@ class MapView(QWidget):
                 p.drawText(QRectF(center.x() - 22, center.y() + 11, 44, 12),
                            Qt.AlignCenter, name)
 
+    def _draw_dyn_blocks(self, p: QPainter):
+        """런타임 차단 노드 오버레이. reroute=우회(주황 링), goal_blocked/no_route=대기(빨강 링).
+
+        정적 nodes.yaml blocked(빨강 X)와 구분되도록 링+X로 그린다.
+        """
+        for node, kind in self._dyn_blocks.items():
+            n = self._graph.nodes.get(node)
+            if not n:
+                continue
+            center = self._to_screen(n['x'], n['y'])
+            color = theme.ORANGE if kind == 'reroute' else theme.RED
+            p.setPen(QPen(QColor(color), 2.5))
+            p.setBrush(Qt.NoBrush)
+            r = 11.0
+            p.drawEllipse(center, r, r)
+            x = r * 0.5
+            p.drawLine(QPointF(center.x() - x, center.y() - x),
+                       QPointF(center.x() + x, center.y() + x))
+            p.drawLine(QPointF(center.x() - x, center.y() + x),
+                       QPointF(center.x() + x, center.y() - x))
+
     def _draw_dock_arrows(self, p: QPainter, center: QPointF, dock, color: str):
         """도킹 진입 방향 표시. nodes.yaml의 dock은 문자열 또는 리스트(N5=[E,N])."""
         if not dock:
@@ -175,7 +203,8 @@ class MapView(QWidget):
         p.setFont(font)
 
         items = [(theme.BLUE, '냉장랙'), (theme.CYAN, '냉동랙'), (theme.AMBER, '출고'),
-                 (theme.GREEN, '입고'), (theme.VIOLET, '홈'), (theme.RED, '장애물')]
+                 (theme.GREEN, '입고'), (theme.VIOLET, '홈'), (theme.RED, '장애물'),
+                 (theme.ORANGE, '우회차단')]
         x, y = 10, self.height() - 16
         for color, label in items:
             p.setBrush(QBrush(QColor(color)))
