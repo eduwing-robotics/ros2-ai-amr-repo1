@@ -27,9 +27,13 @@ def generate_launch_description():
         # 도크별 마커 법선 오프셋(deg). 정지 관측 e_θ 를 그대로 넣는다. 0 = 보정 없음.
         DeclareLaunchArgument('marker_yaw_offset_deg', default_value='0.0'),
         # 재배치 스킵 임계(m). 이 이내면 PREALIGN 생략 → SERVO 직행(스킵 케이스).
-        DeclareLaunchArgument('prealign_min_ey', default_value='0.010'),
+        DeclareLaunchArgument('prealign_min_ey', default_value='0.005'),
         # 마커축 ↔ 슬롯중심 측면 오프셋(m). 실물 안착 편차를 재서 넣는다(밀리는 반대 부호).
         DeclareLaunchArgument('target_lateral_offset', default_value='0.0'),
+        # 라이다 벽 법선으로 coupled SERVO(work). false=기존 staging. 상세: 벽피팅 검증 2026-07-20.
+        DeclareLaunchArgument('use_lidar_normal', default_value='true'),
+        # base_scan yaw 마운트 + 편향 보정(deg). 등거리/도킹 실측으로 확정.
+        DeclareLaunchArgument('lidar_yaw_offset_deg', default_value='0.0'),
         Node(
             package='aruco_docking', executable='aruco_estimator', name='aruco_estimator',
             output='screen',
@@ -52,6 +56,10 @@ def generate_launch_description():
                     LaunchConfiguration('prealign_min_ey'), value_type=float),
                 'target_lateral_offset': ParameterValue(
                     LaunchConfiguration('target_lateral_offset'), value_type=float),
+                'use_lidar_normal': ParameterValue(
+                    LaunchConfiguration('use_lidar_normal'), value_type=bool),
+                'lidar_yaw_offset_deg': ParameterValue(
+                    LaunchConfiguration('lidar_yaw_offset_deg'), value_type=float),
             }],
             # odom = raw 휠(IMU 없음, 바닥 슬립 시 yaw 틀어짐) → EKF 융합 출력으로.
             #   PREALIGN·CREEP·UNDOCK의 회전(yaw) 정밀도 개선. (EKF는 smart_robot_bringup에서 발행)

@@ -230,9 +230,11 @@ class ArucoEstimatorNode(Node):
                     "→ TF 변환 불가. 카메라 드라이버 frame_id 확인 필요.")
                 self._warned_no_frame = True
             pose.header.frame_id = frame_id
-            pose.pose.position.x = float(tvec[0])
-            pose.pose.position.y = float(tvec[1])
-            pose.pose.position.z = float(tvec[2])
+            # tvec은 (3,1) → flatten. numpy 2.x는 1원소 1차원 배열의 float()도 TypeError.
+            t = tvec.reshape(-1)
+            pose.pose.position.x = float(t[0])
+            pose.pose.position.y = float(t[1])
+            pose.pose.position.z = float(t[2])
             pose.pose.orientation.x = qx
             pose.pose.orientation.y = qy
             pose.pose.orientation.z = qz
