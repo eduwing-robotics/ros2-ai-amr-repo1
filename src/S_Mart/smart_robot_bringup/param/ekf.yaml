@@ -4,10 +4,13 @@ ekf_filter_node:
   ros__parameters:
     # 20Hz: Pi CPU 공유(nav2와 같은 기기) 부담 완화. 소비자 전수 확인(2026-07-13):
     # controller 10Hz·costmap 5/1Hz·AMCL(tol 0.5s) 전부 2배 이상 여유,
-    # 도킹은 raw /odom 직구독이라 무관. 유일한 얇은 지점 = Rotation Shim의
-    # "now" TF 조회(0.1s 대기 vs 발행 틈 50ms) — 간헐 U턴 재발 시
-    # transform_time_offset: 0.05 추가가 1순위 처방.
+    # 도킹은 raw /odom 직구독이라 무관.
     frequency: 20.0
+    # ★ 적용(2026-07-19): odom tf를 50ms 미래로 스탬프 → 20Hz 발행틈(50ms)에 스캔이
+    #   도착해도 tf가 이미 준비돼 있어 "extrapolation into the future" 방지.
+    #   실기 확인: base_scan이 odom tf보다 ~21ms 앞서 costmap 스캔드롭·follow_path abort·
+    #   goal 재전송(traffic 도착 desync)이 연쇄 발생 → 이 값으로 근본 해소.
+    transform_time_offset: 0.05
     two_d_mode: true                 # 평면 로봇
     publish_tf: true
     map_frame: map
