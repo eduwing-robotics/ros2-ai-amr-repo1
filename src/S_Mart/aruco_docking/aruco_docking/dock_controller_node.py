@@ -39,13 +39,16 @@ import math
 import threading
 import time
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener, TransformException
 import tf2_geometry_msgs  # noqa: F401
@@ -101,7 +104,7 @@ class DockControllerNode(Node):
         #   측면 이동은 법선에 수직이라 depth(런웨이) 소모 0. 회전 odom오차는 SERVO가 폐루프로 청소.
         #   실패 시 enable_prealign:=false 로 즉시 옛 동작(바로 SERVO) 복귀.
         self.declare_parameter('enable_prealign', True)
-        self.declare_parameter('prealign_min_ey', 0.010)    # e_y 이 이내면 재배치 스킵(이미 축 위). 1cm=재배치 오픈루프 정밀바닥(회전-직진-회전, odom회전2번+마커노이즈). 5mm 재시도(2026-07-18) 폐기: PREALIGN 정밀도는 STAGE_GOTO+APPROACH(m_y)가 덮어써 결과 무영향 → 이득 없이 재배치 빈발·리밋사이클 리스크만 추가
+        self.declare_parameter('prealign_min_ey', 0.005)    # e_y 이 이내면 재배치 스킵(이미 축 위). 1cm=재배치 오픈루프 정밀바닥(회전-직진-회전, odom회전2번+마커노이즈). 5mm 재시도(2026-07-18) 폐기: PREALIGN 정밀도는 STAGE_GOTO+APPROACH(m_y)가 덮어써 결과 무영향 → 이득 없이 재배치 빈발·리밋사이클 리스크만 추가
         self.declare_parameter('prealign_max_ey', 0.10)     # 측면직진 거리 상한(안전 캡)
         self.declare_parameter('prealign_omega', 0.3)       # 90° 회전 각속도
         self.declare_parameter('prealign_v', 0.03)          # 측면 직진 속도
@@ -186,6 +189,15 @@ class DockControllerNode(Node):
         self.declare_parameter('marker_timeout_sec', 0.7)
         self.declare_parameter('dock_timeout_sec', 40.0)     # PREALIGN 단일패스(~14s)+SERVO/ALIGN/CREEP(~18s) 수용.
 
+        # ── 라이다 벽 법선 (coupled SERVO 헤딩 소스). false면 기존 마커/staging 경로 그대로 ──
+        self.declare_parameter('use_lidar_normal', False)
+        self.declare_parameter('lidar_scan_topic', 'scan')
+        self.declare_parameter('lidar_sector_deg', 30.0)     # 전방 ±섹터 (벽 피팅용)
+        self.declare_parameter('lidar_range_min', 0.05)
+        self.declare_parameter('lidar_range_max', 1.5)
+        self.declare_parameter('lidar_yaw_offset_deg', 0.0)  # base_scan 마운트 yaw + 편향 보정(캘리브)
+        self.declare_parameter('lidar_max_stale_sec', 0.5)   # 벽피팅 신선도 한도
+
         g = self.get_parameter
         self.base_frame = g('base_frame').value
         self.stop_dist = float(g('stop_dist').value)
@@ -247,6 +259,13 @@ class DockControllerNode(Node):
         self.home_max_ey = float(g('home_max_ey').value)
         self.marker_timeout = float(g('marker_timeout_sec').value)
         self.dock_timeout = float(g('dock_timeout_sec').value)
+        self.use_lidar_normal = bool(g('use_lidar_normal').value)
+        self.lidar_scan_topic = g('lidar_scan_topic').value
+        self.lidar_sector = math.radians(float(g('lidar_sector_deg').value))
+        self.lidar_rmin = float(g('lidar_range_min').value)
+        self.lidar_rmax = float(g('lidar_range_max').value)
+        self.lidar_yaw_off = math.radians(float(g('lidar_yaw_offset_deg').value))
+        self.lidar_max_stale = float(g('lidar_max_stale_sec').value)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -282,12 +301,20 @@ class DockControllerNode(Node):
         self._creep_t0 = None
         self._creep_max = 0.0         # 정체감지: 지금까지 최대 진행거리
         self._creep_prog_t = None     # 정체감지: 마지막 진행 시각
+        self._wall_nx = None          # 라이다 벽 법선(base_link, 마커 규약=벽→로봇)
+        self._wall_ny = None
+        self._wall_eth = None         # 라이다 헤딩오차(비교/로그용)
+        self._wall_t = None           # 최근 벽피팅 시각(신선도)
 
         cb = ReentrantCallbackGroup()
         self.cmd_pub = self.create_publisher(TwistStamped, 'cmd_vel', 10)
         self.create_subscription(
             PoseStamped, 'detected_dock_pose', self.pose_cb, 10, callback_group=cb)
         self.create_subscription(Odometry, 'odom', self.odom_cb, 10, callback_group=cb)
+        if self.use_lidar_normal:
+            # /scan은 BEST_EFFORT(센서 QoS) → 반드시 맞춰야 수신됨
+            self.create_subscription(LaserScan, self.lidar_scan_topic, self.scan_cb,
+                                     qos_profile_sensor_data, callback_group=cb)
         self.create_timer(self.control_dt, self.control_step, callback_group=cb)
         if not self.log_only:
             self.create_service(Trigger, 'start_work_dock', self.on_start_work_dock, callback_group=cb)
@@ -301,7 +328,14 @@ class DockControllerNode(Node):
             f"creep={self.creep_speed} max_creep={self.max_creep_dist} "
             f"marker_yaw_off={math.degrees(self.marker_yaw_off):+.2f}° "
             f"prealign_min_ey={self.prealign_min_ey} lat_off={self.lat_offset:+.4f}m "
-            f"| ω=−k_y·e_y+k_θ·e_θ")
+            f"| ω=−k_y·e_y+k_θ·e_θ "
+            f"| lidar_normal={self.use_lidar_normal} "
+            f"lidar_off={math.degrees(self.lidar_yaw_off):+.2f}°")
+        # 라이다 켰는데 편향 미보정이면 헤딩 영점이 틀어져 크루키 도킹 위험 → 경고
+        if self.use_lidar_normal and abs(self.lidar_yaw_off) < 1e-6:
+            self.get_logger().warn(
+                'use_lidar_normal=true 인데 lidar_yaw_offset_deg=0 (미보정) — '
+                '로봇별 라이다 마운트 편향값을 넣어야 헤딩이 진짜 수직에 맞음')
 
     # ── EMA ────────────────────────────────────────────────────────
     def _ema(self, prev, new):
@@ -323,6 +357,44 @@ class DockControllerNode(Node):
         yaw = _yaw_from_quat(msg.pose.pose.orientation)
         with self._lock:
             self._odom = (float(p.x), float(p.y), yaw)
+
+    def scan_cb(self, s: LaserScan):
+        """전방 섹터 직선피팅 → 벽 법선(base_link) → e_θ. use_lidar_normal일 때만 구독됨.
+
+        검증 완료(2026-07-20): 정지 σ0.17°·잔차1.3mm, 회전추종 기울기 −1.00.
+        ※ base_scan 이 base_link 와 yaw 정렬됐다고 가정하고 lidar_yaw_off 로 마운트/편향 보정.
+          (평행이동은 법선각에 무영향.) 스캔프레임이 yaw로 돌아있으면 그 값을 lidar_yaw_off 에.
+        """
+        half = self.lidar_sector
+        pts = []
+        for i, r in enumerate(s.ranges):
+            if math.isinf(r) or math.isnan(r) or not (self.lidar_rmin < r < self.lidar_rmax):
+                continue
+            a = s.angle_min + i * s.angle_increment
+            if abs(math.atan2(math.sin(a), math.cos(a))) > half:   # 전방 0 주변 wrap 처리
+                continue
+            pts.append((r * math.cos(a), r * math.sin(a)))
+        if len(pts) < 8:
+            self.get_logger().warn(f'라이다 전방 섹터 점 {len(pts)}개 — 벽 미검출',
+                                   throttle_duration_sec=2.0)
+            return
+        P = np.array(pts)
+        _, v = np.linalg.eigh(np.cov((P - P.mean(axis=0)).T))
+        n = v[:, 0]                          # 최소 고유값 고유벡터 = 법선
+        if n[0] < 0.0:
+            n = -n                           # n = 로봇→벽 (+x)
+        # base_scan yaw 마운트/편향 보정
+        c, si = math.cos(self.lidar_yaw_off), math.sin(self.lidar_yaw_off)
+        nx, ny = c * n[0] - si * n[1], si * n[0] + c * n[1]
+        # 마커 법선 규약(벽→로봇)에 맞춰 반전 → _extract_errors 공식 그대로 재사용 가능
+        # TODO(HW): 이 부호는 실물서 로그의 라이다 e_θ 가 마커 e_θ 와 같은 부호인지로 확정.
+        nx, ny = -nx, -ny
+        eth = _norm(math.atan2(-ny, -nx))    # 마커 e_θ 와 동일 정의(수직이면 0)
+        with self._lock:
+            self._wall_nx, self._wall_ny, self._wall_eth = nx, ny, eth
+            self._wall_t = time.time()
+        self.get_logger().info(f'[wall] e_θ={math.degrees(eth):+.2f}° pts={len(pts)}',
+                               throttle_duration_sec=self.log_period)
 
     # ── pose 콜백: TF → 오차 → EMA → 저장 + 로그 ───────────────────
     def pose_cb(self, msg: PoseStamped):
@@ -402,6 +474,18 @@ class DockControllerNode(Node):
         # cross-track(부호) − 슬롯중심 계통 오프셋 보정 → 목표를 '슬롯축' 위로 (home SERVO/PREALIGN용)
         e_y = (m_y * nx - m_x * ny) - self.lat_offset
         e_theta = _norm(math.atan2(-ny, -nx))
+
+        # ── 라이다 법선으로 e_y·e_θ 교체 (마커 위치 m_x·m_y·depth 는 유지) ──
+        #   축(법선)만 정확한 라이다로 → 편향 3.7° 제거. 신선한 벽피팅 있을 때만.
+        #   ★ work(전진)에만: 라이다 전방 섹터는 앞 벽 → home(후진, 뒤 벽 도킹)엔 부적합.
+        if self.use_lidar_normal and not self._reverse:
+            with self._lock:
+                wnx, wny, wt = self._wall_nx, self._wall_ny, self._wall_t
+            if wnx is not None and wt is not None and (time.time() - wt) < self.lidar_max_stale:
+                nx, ny = wnx, wny
+                e_y = (m_y * nx - m_x * ny) - self.lat_offset
+                e_theta = _norm(math.atan2(-ny, -nx))
+
         # 반환 (nx,ny)=raw(work EMA 소비) / e_y·e_θ·ρ=트림 적용(home 소비)
         return rho, e_y, e_theta, depth, (nx_raw, ny_raw), (m_x, m_y)
 
@@ -468,7 +552,7 @@ class DockControllerNode(Node):
             if abs(ey) < self.prealign_min_ey:
                 self.get_logger().info(
                     f"PREALIGN 종료 (e_y={ey:+.4f}, 축 위) → "
-                    f"{'SERVO' if self._reverse else 'STAGE_GOTO'}")
+                    f"{'SERVO' if (self._reverse or self.use_lidar_normal) else 'STAGE_GOTO'}")
                 self._enter_after_prealign()
                 return
             eyt = _clamp(abs(ey), 0.0, self.prealign_max_ey)
@@ -525,7 +609,7 @@ class DockControllerNode(Node):
                 self._stop()
                 self.get_logger().info(
                     "PREALIGN TURN2(−90°) 완료 → "
-                    f"{'SERVO' if self._reverse else 'STAGE_GOTO'}")
+                    f"{'SERVO' if (self._reverse or self.use_lidar_normal) else 'STAGE_GOTO'}")
                 self._enter_after_prealign()
                 return
             self._publish(0.0, -self._pa_dir * self.prealign_omega)
@@ -852,8 +936,11 @@ class DockControllerNode(Node):
     def _enter_after_prealign(self):
         if self._reverse:
             self._enter_servo()          # home: EMA 리셋 + SERVO
+        elif self.use_lidar_normal:
+            # work + 라이다: 구버전 coupled SERVO 복귀(법선=라이다). staging 우회 → 헤딩 연속 제어.
+            self._enter_servo()
         else:
-            self._enter_stage_goto()     # work: EMA 유지 + STAGE_GOTO
+            self._enter_stage_goto()     # work 기본: EMA 유지 + STAGE_GOTO
 
     def _timed_out(self, now):
         return self._start_t is not None and (now - self._start_t) > self.dock_timeout
