@@ -67,8 +67,8 @@ class TaskManagerNode(Node):
         self._main_db = psycopg2.connect(_DSN)
 
         # 미수령 시한 — 냉동은 녹으므로 더 짧게. awaiting_pickup 시점부터 센다.
-        self.declare_parameter('chilled_timeout', 30.0)
-        self.declare_parameter('frozen_timeout', 15.0)
+        self.declare_parameter('chilled_timeout', 45.0)   # 냉장 45초
+        self.declare_parameter('frozen_timeout', 30.0)    # 냉동 30초 (녹으므로 냉장보다 짧게)
 
         # 미수령 마감 — {게이트: (order_id, time.monotonic() 기준 마감)}.
         # 서브 스레드(LISTEN)가 쓰고 메인 스레드(1Hz 검사)가 읽고 지우므로 락 필요.
