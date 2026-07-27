@@ -27,9 +27,11 @@ from launch_ros.actions import Node
 
 # 스폰 위치 — 실기 홈 (config/spawn.yaml과 동일 값, launch에서 직접 사용)
 ROBOTS = [
-    # (모델, 도메인, x, y, yaw)  — 코를 서쪽(W)으로
-    ('burger1', '30', 1.214, -0.064, 3.14159),   # AMR_1 @ N25 (home_A)
-    ('burger2', '31', 1.214, 0.236, 3.14159),    # AMR_2 @ N20 (home_B)
+    # (모델, 도메인, x, y, yaw)  — 코를 동쪽(E)으로 (홈 dock:E).
+    # ★ FSM _auto_init이 홈을 dock 방향(E, yaw 0.0)으로 AMCL 초기화하므로
+    #   스폰 yaw도 반드시 0.0 — π면 Gazebo 실제 자세와 AMCL 초기 자세가 180° 어긋남.
+    ('burger1', '30', 1.214, -0.064, 0.0),   # AMR_1 @ N25 (home_A)
+    ('burger2', '31', 1.214, 0.236, 0.0),    # AMR_2 @ N20 (home_B)
 ]
 SERVER_DOMAIN = '12'
 
