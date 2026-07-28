@@ -16,3 +16,11 @@
 AI Object Detection을 통한 물품 인식 및 분류
 ## 통합 운영 시스템
 FMS 기반 자동 임무 관리
+
+
+||Username|Role|
+|---|---|---|
+|<img src="https://avatars.githubusercontent.com/u/230269065?v=4" width="50" height="50" alt="Profile Icon" />|김현수(팀장)|멀티 로봇 Path Planning 개발, Navigation 구축, BT 설계, FSM 구현|
+|<img src="https://avatars.githubusercontent.com/u/204587717?v=4" width="50" height="50" alt="Profile Icon" />|권예찬|System Architecture 및 FSM 설계 및 구현, ArUco 정밀제어, Forklift 모듈 개발|
+||김영호|Forklift 모델링, 사용자 UI, Qt 기반 관제 GUI 개발|
+|<img src="https://avatars.githubusercontent.com/u/175606120?v=4" width="50" height="50" alt="Profile Icon" />|박인한|AI 비전 모델 학습(입/출고 물품 인식 모델, 사람 인식 모델)|
