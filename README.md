@@ -38,7 +38,7 @@
 <table style="border-collapse: collapse;">
   <tr>
     <td align="center" style="border: 2px solid #c4c4c4; padding: 6px 16px;"><b>개발 기간</b></td>
-    <td align="center" style="border: 2px solid #c4c4c4; padding: 6px 16px;">2026.05.25 ~ 2026.07.24</td>
+    <td align="center" style="border: 2px solid #c4c4c4; padding: 6px 16px;">2026.05.26 ~ 2026.07.24</td>
   </tr>
 </table>
 
@@ -72,7 +72,7 @@
     <td align="center" style="border: 2px solid #c4c4c4; padding: 8px 16px; background-color: #f0f0f0;"><b>설명</b></td>
   </tr>
   <tr>
-    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">🧊 <b>AI 입고 분류 및 출고 감지</b></td>
+    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">🔍 <b>AI 입고 분류 및 출고 감지</b></td>
     <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">Vision AI가 입고 게이트에서 물품을 인식(분류)하고, 출고 게이트에서는 물품의 실제 출고 여부를 감지</td>
   </tr>
   <tr>
@@ -84,14 +84,18 @@
     <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">FMS가 임무를 로봇에 할당·배정, 그래프(노드/엣지) 기반 경로 계획 + 노드 예약 관리(충돌 방지 및 교착 해결), 입고/출고/회수/주문취소 수행</td>
   </tr>
   <tr>
-    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">🖥️ <b>실시간 관제</b></td>
+    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">📊 <b>실시간 관제</b></td>
     <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">관제 GUI로 로봇 위치·임무 진행·재고·슬롯 상태를 실시간 모니터링</td>
   </tr>
   <tr>
-    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">🔄 <b>미수령 상품 회수 (콜드체인 물류)</b></td>
+    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">🧊 <b>미수령 상품 회수 (콜드체인 물류)</b></td>
     <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">신선도 유지를 위해 상품(온도대)별 타임아웃을 적용하고 AI가 실제 출고 여부를 감지, 시간 내 미수령 시 상품을 회수하여 보관 창고로 재입고</td>
   </tr>
 </table>
+
+### 🔄 동작 시나리오
+
+<img src="assets/operation-scenario.png" alt="동작 시나리오: 01 입고 감지 → 02 임무 생성 → 03 로봇 적재·주행 → 04 출고 주문 → 05 미수령 회수" width="900">
 
 ### 👥 팀원 소개
 
