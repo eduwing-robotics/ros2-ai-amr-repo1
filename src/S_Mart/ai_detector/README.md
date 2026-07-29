@@ -72,6 +72,7 @@ rqt                                            # Image View → /detection/inbou
 - 현재 매핑 근거: `client/src/constants.ts` EMOJI_MAP의 상품 6종
   (사과·배·콜라·생선·아이스크림·냉동피자). Drinks·other_* 4클래스는 DB에
   해당 상품이 없어 `null`(무시) — 의도인지 팀원과 최종 확인 필요.
+  -> 모델의 분류 능력 향상을 위한 클래스들이므로 이 프로젝트에선 처리할 필요 없음
 
 ## 알려진 이슈
 
