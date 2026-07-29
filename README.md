@@ -84,7 +84,11 @@
     <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">FMS가 임무를 로봇에 할당·배정, 그래프(노드/엣지) 기반 경로 계획 + 노드 예약 관리(충돌 방지 및 교착 해결), 입고/출고/회수/주문취소 수행</td>
   </tr>
   <tr>
-    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">📊 <b>실시간 관제</b></td>
+    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;"><img src="assets/icon-forklift.png" width="18" alt="지게차"> <b>자율 적재 · 운반 (Fork Lift)</b></td>
+    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;"><b>정밀 제어</b>를 통해 랙 슬롯에 도킹, <b>micro-ROS</b>로 연동된 <b>ESP32</b>가 포크를 제어해 물품을 스스로 적재·하역</td>
+  </tr>
+  <tr>
+    <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">💻 <b>실시간 관제</b></td>
     <td style="border: 2px solid #c4c4c4; padding: 8px 16px;">관제 GUI로 로봇 위치·임무 진행·재고·슬롯 상태를 실시간 모니터링</td>
   </tr>
   <tr>
@@ -95,7 +99,7 @@
 
 ### 🔄 동작 시나리오
 
-<img src="assets/operation-scenario.png" alt="동작 시나리오: 01 입고 감지 → 02 임무 생성 → 03 로봇 적재·주행 → 04 출고 주문 → 05 미수령 회수" width="900">
+<img src="assets/operation-scenario.png" alt="동작 시나리오: 01 입고 감지 → 02 임무 생성 → 03 로봇 적재·주행 → 04 출고 주문 → 05 미수령 회수" width="1089">
 
 ### 👥 팀원 소개
 
