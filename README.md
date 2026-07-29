@@ -97,7 +97,7 @@
 
 <table style="border-collapse: collapse;">
   <tr>
-    <td align="center" style="border: 2px solid #c4c4c4; padding: 8px 16px; background-color: #f0f0f0;"><b>이름</b></td>
+    <td align="center" width="150" style="border: 2px solid #c4c4c4; padding: 8px 16px; background-color: #f0f0f0;"><b>이름</b></td>
     <td align="center" style="border: 2px solid #c4c4c4; padding: 8px 16px; background-color: #f0f0f0;"><b>담당</b></td>
   </tr>
   <tr>
