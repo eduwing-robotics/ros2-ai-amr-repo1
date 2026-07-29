@@ -24,8 +24,8 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
-  <!-- 노드 그래프(nodes.yaml)를 path_plan_manager share에서 읽음 -->
-  <exec_depend>path_plan_manager</exec_depend>
+  <!-- 노드 그래프(nodes.yaml)를 traffic_manager share에서 읽음 -->
+  <exec_depend>traffic_manager</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
