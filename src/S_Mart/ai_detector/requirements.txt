@@ -1,0 +1,6 @@
+# ai_detector — Vision AI(YOLO) 추론 의존성
+# ultralytics 설치 시 torch · torchvision · opencv 등이 함께 설치된다.
+ultralytics
+
+# 환경에 따라 필요할 수 있는 핀 (설치 이슈 발생 시 주석 해제):
+# setuptools<80
